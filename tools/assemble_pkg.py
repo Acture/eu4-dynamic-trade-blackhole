@@ -25,7 +25,7 @@ schema = 1
 [plugin]
 name = "eu4-dynamic-trade-blackhole"
 repository = "https://github.com/Acture/eu4-dynamic-trade-blackhole"
-version = "0.1.0"
+version = "0.0.1"
 authors = ["acturea"]
 description = "Closes and reopens vanilla outgoing trade routes so trade converges toward wealthy nodes instead of the fixed vanilla end nodes."
 
