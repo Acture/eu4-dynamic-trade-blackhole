@@ -73,9 +73,14 @@ per playset in `~/.config/foch/plugins/selections.toml`.
 
 ## Build, package, run
 
+This package lives at `plugins/eu4-dynamic-trade-blackhole` inside the
+[Foch](https://github.com/Acture/foch) checkout (a git submodule and a
+workspace member); build it from the Foch root, not from this clone
+alone.
+
 ```powershell
 cargo build -p foch-plugin-trade-blackhole -p foch-eu4-host -p foch-cli --release --locked
-uv run python -I src/packages/foch-plugin-trade-blackhole/tools/assemble_pkg.py
+uv run python -I plugins/eu4-dynamic-trade-blackhole/tools/assemble_pkg.py
 foch plugin import ./target/plugin-pkg
 foch plugin enable dev.foch.trade-blackhole --playset default
 foch plugin plan --playset default --game-path <EU4>
@@ -96,7 +101,7 @@ host is staged into the test session's runtime layer through
 `foch test --with-plugins`):
 
 ```powershell
-foch test src/packages/foch-plugin-trade-blackhole/tests/e2e-mod `
+foch test plugins/eu4-dynamic-trade-blackhole/tests/e2e-mod `
   --with-plugins default --game-path <EU4> --timeout 900
 ```
 

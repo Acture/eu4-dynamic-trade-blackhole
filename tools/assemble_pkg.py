@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent.parent
-REPO = PACKAGE.parent.parent.parent
+REPO = PACKAGE.parent.parent
 PKG = REPO / "target/plugin-pkg"
 DLL = REPO / "target/release/foch_plugin_trade_blackhole.dll"
 MEMBERS = PACKAGE / "tools/node_members.txt"

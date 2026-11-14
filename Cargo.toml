@@ -1,18 +1,22 @@
 [package]
 name = "foch-plugin-trade-blackhole"
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+homepage = "https://github.com/Acture/foch"
+repository = "https://github.com/Acture/foch"
 description = "Dynamic trade-topology EU4 plugin for the Foch native host"
 publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
+# Mounted inside the Foch checkout (plugins/eu4-dynamic-trade-blackhole),
+# the ABI resolves through the workspace; a standalone clone cannot build
+# the DLL by design. Literal values (no .workspace inheritance) follow
+# the tree-sitter-paradox submodule convention.
 [dependencies]
-foch-plugin-abi = { path = "../foch-plugin-abi" }
-serde.workspace = true
-serde_json.workspace = true
+foch-plugin-abi = { path = "../../src/packages/foch-plugin-abi" }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_json = "1.0.145"
