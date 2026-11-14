@@ -1,0 +1,52 @@
+name: release
+
+# Publishes the plugin package as a standalone DLL release: users
+# import it with `foch plugin import <unzipped asset>` without building
+# Foch themselves. The DLL still compiles inside a Foch checkout (the
+# ABI is a path dependency until foch-plugin-abi lands on crates.io),
+# so the job mounts this repository's tag at the submodule slot of a
+# clean Foch clone and builds there.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone Foch and mount this tag at the submodule slot
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/Acture/foch.git ../foch
+          $slot = "../foch/plugins/eu4-dynamic-trade-blackhole"
+          New-Item -ItemType Directory -Force -Path "../foch/plugins" | Out-Null
+          # The checked-out tag overwrites whatever the submodule points
+          # at, so releases carry exactly the tagged source.
+          if (Test-Path $slot) { Remove-Item -Recurse -Force $slot }
+          Copy-Item -Recurse . $slot
+          # Pre-submodule Foch still lists the in-tree package as a
+          # member; swap the member path when needed.
+          $manifest = "../foch/Cargo.toml"
+          (Get-Content $manifest) `
+            -replace '"src/packages/foch-plugin-trade-blackhole"', '"plugins/eu4-dynamic-trade-blackhole"' `
+            | Set-Content $manifest
+          if (Test-Path "../foch/src/packages/foch-plugin-trade-blackhole") {
+            Remove-Item -Recurse -Force "../foch/src/packages/foch-plugin-trade-blackhole"
+          }
+      - name: Build the DLL
+        run: cargo build --release --locked --manifest-path ../foch/Cargo.toml -p foch-plugin-trade-blackhole
+      - name: Assemble the plugin package
+        working-directory: ../foch/plugins/eu4-dynamic-trade-blackhole
+        run: python tools/assemble_pkg.py
+      - name: Zip the package
+        run: Compress-Archive -Path ../foch/target/plugin-pkg/* -DestinationPath eu4-dynamic-trade-blackhole-${{ github.ref_name }}.zip
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: eu4-dynamic-trade-blackhole-${{ github.ref_name }}.zip
+          generate_release_notes: true

@@ -70,7 +70,7 @@ git submodule update --init
 cargo build -p foch-plugin-trade-blackhole -p foch-eu4-host -p foch-cli --release --locked
 uv run python -I plugins/eu4-dynamic-trade-blackhole/tools/assemble_pkg.py
 foch plugin import ./target/plugin-pkg
-foch plugin enable dev.foch.trade-blackhole --playset default
+foch plugin enable acture.eu4-dynamic-trade-blackhole --playset default
 foch plugin launch --playset default
 ```
 

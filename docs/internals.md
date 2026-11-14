@@ -134,3 +134,28 @@ auto-closed by window enumeration) is scripted in the RE workspace, not
 in this repository. Test effects must be real effects: `owner = X` and
 `treasury = 0` are trigger syntax and crash the game at effect
 application — use `change_owner` / `add_treasury`.
+
+## Extracting shared services toward the host
+
+Pieces of this plugin are generally useful and should not stay
+plugin-private. Candidates, in extraction order:
+
+1. **Safe memory accessors** (`read_qword`/`read_i32`/`read_u8`/
+   `write_*` with plausibility guards) — pure utility, plugin-agnostic.
+2. **The exe pin + pattern-resolution flow** (digest check, signature
+   table per build) — every pinned-build plugin reimplements this.
+3. **The route-vector mutation primitive** (capture vanilla, open-first
+   rewrite, reversible end shrink) — any topology-touching plugin wants
+   exactly this.
+4. **Country services** (index→`CCountry*`, treasury payment with the
+   UI dirty bit) — income-touching plugins want this.
+
+Items 1–2 belong in the host's API table (append-only, versioned by
+`abi_major`); items 3–4 are EU4 game knowledge rather than host
+services and fit better as a shared `foch-eu4-sdk` crate that plugins
+depend on alongside `foch-plugin-abi`. Deliberately not done yet:
+extending the C ABI table is a breaking-change decision for the host
+project and deserves its own review, and publishing `foch-plugin-abi`
+to crates.io (it is 211 lines, zero dependencies, currently
+`publish = false`) would make standalone plugin builds possible — one
+`cargo publish` away once the foch side opts in.

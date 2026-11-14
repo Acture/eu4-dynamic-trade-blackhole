@@ -23,7 +23,7 @@ MANIFEST = """\
 schema = 1
 
 [plugin]
-id = "dev.foch.trade-blackhole"
+id = "acture.eu4-dynamic-trade-blackhole"
 name = "Dynamic Trade Blackhole"
 version = "0.1.0"
 authors = ["acturea"]
