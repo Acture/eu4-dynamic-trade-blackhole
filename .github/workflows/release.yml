@@ -22,7 +22,9 @@ jobs:
       - name: Clone Foch and mount this tag at the submodule slot
         shell: pwsh
         run: |
-          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/Acture/foch.git ../foch
+          git clone --depth 1 https://github.com/Acture/foch.git ../foch
+          # Only the build's submodules; the notes vault is private.
+          git -C ../foch submodule update --init --depth 1 src/packages/tree-sitter-paradox src/packages/foch/vendor/cwtools-eu4-config
           $slot = "../foch/plugins/eu4-dynamic-trade-blackhole"
           New-Item -ItemType Directory -Force -Path "../foch/plugins" | Out-Null
           # The checked-out tag overwrites whatever the submodule points
