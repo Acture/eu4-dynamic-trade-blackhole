@@ -12,12 +12,13 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
-# Mounted inside the Foch checkout (plugins/eu4-dynamic-trade-blackhole),
-# the ABI resolves through the workspace; a standalone clone cannot build
-# the DLL by design. Literal values (no .workspace inheritance) follow
-# the tree-sitter-paradox submodule convention.
+# Literal values (no .workspace inheritance) follow the
+# tree-sitter-paradox submodule convention; the SDK patch below makes a
+# standalone clone build on its own.
 [dependencies]
 foch-plugin-sdk = "0.0.1"
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_json = "1.0.145"
 
 # Standalone (this file is the workspace root) the SDK resolves from
 # the Foch repository until the crate lands on crates.io; inside the
@@ -25,5 +26,3 @@ foch-plugin-sdk = "0.0.1"
 # [patch.crates-io] redirects to the local member.
 [patch.crates-io]
 foch-plugin-sdk = { git = "https://github.com/Acture/foch.git", branch = "master" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.145"
