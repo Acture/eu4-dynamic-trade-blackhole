@@ -33,7 +33,7 @@ description = "Closes and reopens vanilla outgoing trade routes so trade converg
 platform = "windows-x86_64"
 game = "eu4"
 game_versions = "=1.37.5"
-abi_major = 1
+abi_major = 0
 
 [entry]
 kind = "native"

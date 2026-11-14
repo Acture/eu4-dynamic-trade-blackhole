@@ -20,7 +20,7 @@ mod policy;
 mod runtime;
 mod state;
 
-use foch_plugin_abi::{
+use foch_plugin_sdk::{
 	ABI_MAJOR, ABI_MINOR, FochHostApi, FochPluginApi, FochStr, result, state as state_code,
 };
 use state::Reason;
@@ -57,7 +57,7 @@ fn refuse(host: &FochHostApi, reason: Reason, detail: &str) -> i32 {
 	// lifetime, and `report` accepts any thread.
 	state::set(state_code::REFUSED, reason);
 	unsafe { (host.report)(host, &state::status()) };
-	logging::write(foch_plugin_abi::log::WARN, detail);
+	logging::write(foch_plugin_sdk::log::WARN, detail);
 	result::OK
 }
 
@@ -77,7 +77,7 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 	let game_version = unsafe { host.game_version.as_str() }.unwrap_or("");
 	let exe_sha256 = unsafe { host.exe_sha256.as_str() }.unwrap_or("");
 	logging::write(
-		foch_plugin_abi::log::INFO,
+		foch_plugin_sdk::log::INFO,
 		&format!(
 			"init: game {game_version}, exe sha256 {exe_sha256}, image 0x{:x}+0x{:x}",
 			host.exe_base as usize, host.exe_size
@@ -87,7 +87,7 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 	let config_bytes = unsafe { (host.config_json)(host).as_bytes().to_vec() };
 	let config = config::Config::from_json(&config_bytes);
 	logging::write(
-		foch_plugin_abi::log::INFO,
+		foch_plugin_sdk::log::INFO,
 		&format!("config: mode {:?}, enabled {}", config.mode, config.enabled),
 	);
 
@@ -112,7 +112,7 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 		let code = unsafe { (host.find_pattern)(host, FochStr::from_str(signature), &mut address) };
 		if code == result::OK && !address.is_null() {
 			logging::write(
-				foch_plugin_abi::log::DEBUG,
+				foch_plugin_sdk::log::DEBUG,
 				&format!("{label} at 0x{:x}", address as usize),
 			);
 			return Ok(address as usize);
@@ -123,7 +123,7 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 			"not found"
 		};
 		logging::write(
-			foch_plugin_abi::log::WARN,
+			foch_plugin_sdk::log::WARN,
 			&format!("{label} pattern {outcome}"),
 		);
 		Err(())
@@ -140,7 +140,7 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 	// happens to share these bytes, which the layout tables do not cover.
 	if tick - host.exe_base as usize != offsets::layout::TICK_RVA {
 		logging::write(
-			foch_plugin_abi::log::WARN,
+			foch_plugin_sdk::log::WARN,
 			&format!(
 				"tick resolved at +0x{:x}, spike recorded +0x{:x}; refusing",
 				tick - host.exe_base as usize,
@@ -187,13 +187,13 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 
 	// The plugin's own read-only package directory carries the offline
 	// node-members table used for the tax aggregation.
-	let dir = unsafe { (host.dir)(host, foch_plugin_abi::dir::PLUGIN) };
+	let dir = unsafe { (host.dir)(host, foch_plugin_sdk::dir::PLUGIN) };
 	let plugin_dir = unsafe { dir.as_str() }.map(std::path::PathBuf::from);
 	runtime::install(config, host.exe_base as usize, plugin_dir);
 	state::set(state_code::ACTIVE, Reason::None);
 	unsafe { (host.report)(host, &state::status()) };
 	logging::write(
-		foch_plugin_abi::log::INFO,
+		foch_plugin_sdk::log::INFO,
 		"active: economy-update hook installed",
 	);
 	result::OK
@@ -203,7 +203,7 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 ///
 /// `out` must be null or a writable `FochStatus`; callers follow the SDK
 /// contract.
-unsafe extern "C" fn status(out: *mut foch_plugin_abi::FochStatus) {
+unsafe extern "C" fn status(out: *mut foch_plugin_sdk::FochStatus) {
 	if let Some(out) = unsafe { out.as_mut() } {
 		*out = state::status();
 	}

@@ -54,7 +54,7 @@ pub unsafe extern "C" fn economy_update_detour(context: *mut c_void, flag: u8) {
 			RUN.store(false, Ordering::Release);
 			crate::state::set_failed_after_panic();
 			crate::logging::write(
-				foch_plugin_abi::log::ERROR,
+				foch_plugin_sdk::log::ERROR,
 				"economy-update step panicked; disabled for this process",
 			);
 		}

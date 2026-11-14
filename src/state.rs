@@ -25,7 +25,7 @@ pub fn set_failed_after_panic() {
 	cell().set(state::FAILED, Reason::EngineError);
 }
 
-use foch_plugin_abi::{FochStatus, FochStr, state};
+use foch_plugin_sdk::{FochStatus, FochStr, state};
 
 /// Plugin-defined reason codes for non-active states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

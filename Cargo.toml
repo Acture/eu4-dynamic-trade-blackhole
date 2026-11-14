@@ -1,6 +1,6 @@
 [package]
 name = "foch-plugin-trade-blackhole"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-only"
@@ -17,6 +17,13 @@ crate-type = ["cdylib"]
 # the DLL by design. Literal values (no .workspace inheritance) follow
 # the tree-sitter-paradox submodule convention.
 [dependencies]
-foch-plugin-abi = { path = "../../src/packages/foch-plugin-abi" }
+foch-plugin-sdk = "0.0.1"
+
+# Standalone (this file is the workspace root) the SDK resolves from
+# the Foch repository until the crate lands on crates.io; inside the
+# Foch workspace a member's patch section is ignored and the root's
+# [patch.crates-io] redirects to the local member.
+[patch.crates-io]
+foch-plugin-sdk = { git = "https://github.com/Acture/foch.git", branch = "master" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.145"

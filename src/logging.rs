@@ -2,7 +2,7 @@
 //! and every later log line goes through it; every host callback is
 //! thread-safe, so the game thread logs directly.
 
-use foch_plugin_abi::{FochHostApi, FochStr, log};
+use foch_plugin_sdk::{FochHostApi, FochStr, log};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
