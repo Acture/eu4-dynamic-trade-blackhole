@@ -13,7 +13,16 @@ import shutil
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent.parent
-REPO = PACKAGE.parent.parent
+# Standalone the package is the repository root itself (target/ lives
+# beside it); mounted inside Foch the repository is two levels up.
+REPO = next(
+    (
+        candidate
+        for candidate in (PACKAGE, PACKAGE.parent, PACKAGE.parent.parent)
+        if (candidate / "target").is_dir()
+    ),
+    PACKAGE.parent.parent,
+)
 PKG = REPO / "target/plugin-pkg"
 DLL = REPO / "target/release/foch_plugin_trade_blackhole.dll"
 MEMBERS = PACKAGE / "tools/node_members.txt"
