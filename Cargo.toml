@@ -13,16 +13,9 @@ publish = false
 crate-type = ["cdylib"]
 
 # Literal values (no .workspace inheritance) follow the
-# tree-sitter-paradox submodule convention; the SDK patch below makes a
-# standalone clone build on its own.
+# tree-sitter-paradox submodule convention; the SDK arrives from
+# crates.io, so a standalone clone builds on its own.
 [dependencies]
 foch-plugin-sdk = "0.0.1"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.145"
-
-# Standalone (this file is the workspace root) the SDK resolves from
-# the Foch repository until the crate lands on crates.io; inside the
-# Foch workspace a member's patch section is ignored and the root's
-# [patch.crates-io] redirects to the local member.
-[patch.crates-io]
-foch-plugin-sdk = { git = "https://github.com/Acture/foch.git", branch = "master" }
