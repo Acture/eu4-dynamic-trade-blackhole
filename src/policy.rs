@@ -870,6 +870,102 @@ mod tests {
 	}
 
 	#[test]
+	fn a_backward_close_emits_a_reverse_edge_addition() {
+		// A high-retention node closing its edge to a producing target
+		// that retains almost nothing: the model asks the engine to grow
+		// the reverse edge so the next round routes toward the sink.
+		let nodes = vec![
+			node(0, 5000.0, 0.98, 1000.0, 100.0, vec![1]),
+			node(1, 500.0, 0.05, 8000.0, 100.0, vec![]),
+		];
+		let closed = mirror(&nodes);
+		let mut ev = evidence(&nodes);
+		// One-month evidence: the mechanism, not the patience window.
+		let params = Params {
+			evidence_months: 1,
+			..Params::default()
+		};
+		let (flips, additions) = plan(&nodes, &closed, &mut ev, &params).unwrap();
+		assert!(
+			flips
+				.iter()
+				.any(|f| f.node == 0 && f.action == FlipAction::Close)
+		);
+		assert!(additions.contains(&ReverseAdd {
+			source: 1,
+			target: 0
+		}));
+	}
+
+	#[test]
+	fn closed_edges_report_their_net_against_the_reference() {
+		let nodes = vec![
+			node(0, 5000.0, 0.98, 8000.0, 100.0, vec![1]),
+			node(1, 500.0, 0.3, 0.0, 100.0, vec![]),
+		];
+		let mut closed = mirror(&nodes);
+		let mut ev = evidence(&nodes);
+		let params = Params {
+			evidence_months: 1,
+			..Params::default()
+		};
+		for flip in plan(&nodes, &closed, &mut ev, &params).unwrap().0 {
+			closed[flip.node as usize][flip.edge] = matches!(flip.action, FlipAction::Close);
+		}
+		let lines = closed_edge_report(&nodes, &closed, &params);
+		assert_eq!(lines.len(), 1, "one closed edge, one line");
+		assert!(lines[0].starts_with("closed edge 0 -> 1: net +"));
+		assert!(
+			lines[0].contains(" / ref "),
+			"carries the reference: {}",
+			lines[0]
+		);
+	}
+
+	#[test]
+	fn an_isolated_node_never_yields_a_nan_pool() {
+		// No production and no inflow: the origin split divides by zero
+		// unless guarded; the pools must simply stay empty and finite.
+		let nodes = vec![node(0, 1000.0, 0.5, 0.0, 100.0, vec![])];
+		let closed = mirror(&nodes);
+		let pools = fee_pools(&nodes, &closed, &Params::default(), 20, 20);
+		assert!(pools.is_empty());
+	}
+
+	#[test]
+	fn under_steered_corridors_are_flagged() {
+		let nodes = vec![
+			node(0, 1000.0, 0.1, 8000.0, 1000.0, vec![1]),
+			node(1, 1000.0, 0.0, 0.0, 5000.0, vec![2]),
+			node(2, 5000.0, 0.9, 0.0, 1000.0, vec![]),
+		];
+		let closed = mirror(&nodes);
+		let report = transit_intelligence(&nodes, &closed, &Params::default());
+		assert!(
+			report.iter().any(|line| line.contains("under-steered")),
+			"the hub carries volume with zero steering: {report:?}"
+		);
+	}
+
+	#[test]
+	fn parameter_boundaries_are_exact() {
+		let at = |flow: i64, reopen: i64| Params {
+			flow_epsilon_pct: flow,
+			reopen_pct: reopen,
+			..Params::default()
+		};
+		assert!(at(0, 15).validate().is_ok());
+		assert!(at(50, 50).validate().is_ok());
+		assert!(at(51, 15).validate().is_err());
+		assert!(at(5, 100).validate().is_ok());
+		assert!(at(5, 101).validate().is_err());
+		assert!(
+			at(10, 5).validate().is_err(),
+			"reopen below the epsilon band"
+		);
+	}
+
+	#[test]
 	fn mirrors_must_match_the_graph() {
 		let nodes = vec![
 			node(0, 1.0, 0.5, 1.0, 1.0, vec![1]),
