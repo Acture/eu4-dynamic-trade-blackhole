@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::offsets::layout;
+use foch_runtime::dataplane::layout;
 
 /// The host-owned next cell, installed once by `init` when the hook is
 /// created. Re-read on every call: the host relinks the chain under us.

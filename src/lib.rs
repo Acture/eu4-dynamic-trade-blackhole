@@ -138,13 +138,13 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 	// Cross-check the resolved address against the spike's recorded RVA:
 	// a matching pattern at a different address means a rebuilt exe that
 	// happens to share these bytes, which the layout tables do not cover.
-	if tick - host.exe_base as usize != offsets::layout::TICK_RVA {
+	if tick - host.exe_base as usize != foch_runtime::dataplane::layout::TICK_RVA {
 		logging::write(
 			foch_plugin_sdk::log::WARN,
 			&format!(
 				"tick resolved at +0x{:x}, spike recorded +0x{:x}; refusing",
 				tick - host.exe_base as usize,
-				offsets::layout::TICK_RVA
+				foch_runtime::dataplane::layout::TICK_RVA
 			),
 		);
 		return refuse(
