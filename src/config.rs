@@ -228,6 +228,25 @@ mod tests {
 	}
 
 	#[test]
+	fn fee_rates_outside_their_band_downgrade_to_observe_only() {
+		for bad in [
+			r#"{"transit_fee_pct":101}"#,
+			r#"{"transit_fee_pct":-1}"#,
+			r#"{"source_fee_pct":101}"#,
+		] {
+			assert!(!Config::from_json(bad.as_bytes()).enabled, "{bad}");
+		}
+		assert!(Config::from_json(br#"{"transit_fee_pct":0,"source_fee_pct":100}"#).enabled);
+	}
+
+	#[test]
+	fn an_unknown_sink_basis_downgrades_to_observe_only() {
+		let config = Config::from_json(br#"{"sink_basis":"vibes"}"#);
+		assert!(!config.enabled);
+		assert_eq!(config.mode, Mode::Observe);
+	}
+
+	#[test]
 	fn crossed_thresholds_downgrade_to_observe_only() {
 		let config = Config::from_json(br#"{"reopen_pct":0}"#);
 		assert!(!config.enabled);

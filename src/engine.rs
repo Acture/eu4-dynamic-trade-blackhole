@@ -591,6 +591,103 @@ mod tests {
 	}
 
 	#[test]
+	fn fee_shares_below_one_thousandth_are_skipped() {
+		// A dust share (power 1 against 10_000_000) must not produce a
+		// payment line: the rounding would misreport it anyway.
+		let state = inner();
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes = vec![
+				NodeSnapshot {
+					id: 0,
+					tax: 1000.0,
+					retention: 0.1,
+					production: 8000.0,
+					trade_power: 1000.0,
+					current_value: 0.0,
+					outgoing: vec![1],
+					steering: vec![0.0],
+				},
+				NodeSnapshot {
+					id: 1,
+					tax: 100.0,
+					retention: 0.9,
+					production: 0.0,
+					trade_power: 100.0,
+					current_value: 0.0,
+					outgoing: vec![],
+					steering: vec![],
+				},
+			];
+			inner.participants = vec![(0, vec![(1, 1.0), (2, 10_000_000.0)])];
+		}
+		let logs = RefCell::new(Vec::new());
+		let mut engine = make(
+			Config {
+				mode: Mode::Policy,
+				evidence_months: 1,
+				..Config::default()
+			},
+			&state,
+			&logs,
+		);
+		engine.tick();
+		let payments = state.borrow().payments.clone();
+		assert_eq!(payments.len(), 1, "only the real share pays: {payments:?}");
+		assert_eq!(payments[0].0, 2);
+	}
+
+	#[test]
+	fn the_policy_tick_logs_the_closed_edge_report() {
+		let state = inner();
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes = vec![
+				NodeSnapshot {
+					id: 0,
+					tax: 5000.0,
+					retention: 0.98,
+					production: 8000.0,
+					trade_power: 100.0,
+					current_value: 0.0,
+					outgoing: vec![1],
+					steering: vec![0.0],
+				},
+				NodeSnapshot {
+					id: 1,
+					tax: 500.0,
+					retention: 0.1,
+					production: 0.0,
+					trade_power: 100.0,
+					current_value: 0.0,
+					outgoing: vec![],
+					steering: vec![],
+				},
+			];
+		}
+		let logs = RefCell::new(Vec::new());
+		let mut engine = make(
+			Config {
+				mode: Mode::Policy,
+				evidence_months: 1,
+				..Config::default()
+			},
+			&state,
+			&logs,
+		);
+		engine.tick();
+		engine.tick();
+		let messages = logs.borrow().join(
+			"
+",
+		);
+		assert!(
+			messages.contains("closed edge 0 -> 1: net"),
+			"the reopen diagnostic lands in the stream: {messages}"
+		);
+	}
+
+	#[test]
 	fn transit_fees_can_be_disabled() {
 		let state = inner();
 		{

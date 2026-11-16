@@ -943,7 +943,96 @@ impl EngineBackend for LiveBackend {
 
 #[cfg(test)]
 mod tests {
-	use super::live_order;
+	use super::{LiveBackend, live_order, parse_members};
+
+	#[test]
+	fn members_parse_into_keys_and_province_ids() {
+		let parsed = parse_members(
+			b"malacca 593 594 junk 595
+siam 592
+",
+		);
+		assert_eq!(
+			parsed,
+			vec![
+				("malacca".to_string(), vec![593, 594, 595]),
+				("siam".to_string(), vec![592]),
+			]
+		);
+	}
+
+	#[test]
+	fn members_skip_lines_without_any_province_id() {
+		// Empty lines, bare keys, and non-numeric fields all drop out.
+		assert!(parse_members(b"").is_empty());
+		assert!(
+			parse_members(
+				b"
+   
+only-a-key"
+			)
+			.is_empty()
+		);
+		assert_eq!(
+			parse_members(b"cape 12 oh-no 13"),
+			vec![("cape".to_string(), vec![12, 13])]
+		);
+	}
+
+	/// Build a fake in-process object so the pointer-walking readers can be
+	/// tested against real (aligned, plausible) addresses.
+	fn scratch(qwords: usize) -> (Vec<u64>, usize) {
+		let mut buffer = vec![0_u64; qwords];
+		let address = buffer.as_mut_ptr() as usize;
+		buffer[0] = address as u64; // self-pointer handy for SSO data
+		(buffer, address)
+	}
+
+	#[test]
+	fn sso_keys_read_inline_and_pointer_forms() {
+		let backend = LiveBackend::new();
+		// Inline: capacity <= 0xF keeps the bytes inside the object.
+		let (mut buffer, address) = scratch(6);
+		buffer[0] = u64::from_le_bytes(*b"zanzibar");
+		buffer[1] = 0;
+		buffer[2] = 8; // length at +0x10
+		buffer[3] = 0xF; // capacity at +0x18
+		assert_eq!(backend.read_sso_key(address).as_deref(), Some("zanzibar"));
+		// Pointer: capacity > 0xF dereferences the first qword, here
+		// aimed at the key bytes living later in the same allocation.
+		let (mut buffer, address) = scratch(6);
+		let data = address + 8 * 5;
+		buffer[0] = data as u64;
+		buffer[2] = 4;
+		buffer[3] = 0x1F;
+		buffer[5] = u64::from_le_bytes(*b"siamxxxx");
+		assert_eq!(backend.read_sso_key(address).as_deref(), Some("siam"));
+	}
+
+	#[test]
+	fn sso_keys_reject_implausible_lengths_and_charset() {
+		let backend = LiveBackend::new();
+		let (mut buffer, address) = scratch(6);
+		buffer[2] = 65; // length beyond the documented key range
+		buffer[3] = 0xF;
+		assert_eq!(backend.read_sso_key(address), None);
+		buffer[2] = 4;
+		buffer[0] = u64::from_le_bytes([b'U', b'P', b'P', b'E', 0, 0, 0, 0]);
+		// Uppercase is not the internal-key charset.
+		assert_eq!(backend.read_sso_key(address), None);
+	}
+
+	#[test]
+	fn tags_unpack_from_the_identity_qword() {
+		let backend = LiveBackend::new();
+		let (mut buffer, address) = scratch(8);
+		// tag in the low bytes, country index in bits 32..48.
+		buffer[4] = u64::from_le_bytes([b'S', b'W', b'E', 0, 4, 0, 0, 0]);
+		assert_eq!(backend.read_tag(address), "SWE");
+		// An implausible address falls back to the question mark rather
+		// than panicking.
+		assert_eq!(backend.read_tag(0), "?");
+	}
 
 	#[test]
 	fn open_entries_stay_first_in_vanilla_order() {
