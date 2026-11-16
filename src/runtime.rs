@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::Config;
 use crate::engine::{Engine, EngineBackend};
-use crate::offsets::layout;
 use crate::policy::NodeSnapshot;
+use foch_runtime::dataplane::{self, Memory};
 
 type LiveEngine = Engine<LiveBackend, fn(i32, &str)>;
 
@@ -72,8 +72,9 @@ pub fn monthly(context: usize, db: usize) {
 	let Some(engine) = ENGINE.get() else { return };
 	let base = EXE_BASE.load(Ordering::Acquire);
 	if base > 0x1_0000 {
-		let stored =
-			unsafe { std::ptr::read((base + layout::CONTEXT_GLOBAL_RVA) as *const u64) } as usize;
+		let stored = Memory
+			.read_qword(base + dataplane::layout::CONTEXT_GLOBAL_RVA)
+			.unwrap_or(0) as usize;
 		if stored != context {
 			crate::logging::write(
 				crate::logging::WARN,
@@ -109,9 +110,7 @@ struct NodeMutation {
 /// open vanilla slots first in vanilla order, closed slots parked at the
 /// tail. Pure, so the ordering is unit-tested without engine memory.
 fn live_order(closed: &[bool]) -> Vec<usize> {
-	let open = (0..closed.len()).filter(|i| !closed[*i]);
-	let shut = (0..closed.len()).filter(|i| closed[*i]);
-	open.chain(shut).collect()
+	dataplane::live_order(closed)
 }
 
 /// Reads and mutates the engine's trade structures. Every access happens
@@ -120,6 +119,8 @@ fn live_order(closed: &[bool]) -> Vec<usize> {
 /// implausible addresses instead of trusting the layout blindly.
 pub struct LiveBackend {
 	db: usize,
+	/// The shared data plane every guarded access goes through.
+	memory: Memory,
 	/// The global game context, kept for the context cross-check.
 	context: usize,
 	/// Per-node mutation state, captured before the first mutation.
@@ -160,6 +161,7 @@ impl LiveBackend {
 	) -> Self {
 		Self {
 			db: 0,
+			memory: Memory,
 			context: 0,
 			mutations: HashMap::new(),
 			vanilla_outgoing: HashMap::new(),
@@ -191,7 +193,7 @@ impl LiveBackend {
 		}
 		self.node_tax.clear();
 		let Some(cprov_base) = self
-			.read_qword(self.context + layout::province::CPROVINCES)
+			.read_qword(self.context + dataplane::layout::province::CPROVINCES)
 			.map(|p| p as usize)
 			.filter(|p| *p > 0x1_0000)
 		else {
@@ -210,9 +212,9 @@ impl LiveBackend {
 			let Some((begin, end)) = self.routes(def) else {
 				continue;
 			};
-			for slot in (begin..end).step_by(layout::route::SIZE) {
+			for slot in (begin..end).step_by(dataplane::layout::route::SIZE) {
 				let Some(target) = self
-					.read_qword(slot + layout::route::TARGET)
+					.read_qword(slot + dataplane::layout::route::TARGET)
 					.map(|p| p as usize)
 				else {
 					continue;
@@ -242,14 +244,14 @@ impl LiveBackend {
 			let mut manpower_sum = 0.0;
 			let mut counted = 0.0;
 			for id in ids {
-				let base = cprov_base + *id as usize * layout::province::CPROVINCE_SIZE;
-				if let Some(tax) = self.read_i32(base + layout::province::TAX) {
+				let base = cprov_base + *id as usize * dataplane::layout::province::CPROVINCE_SIZE;
+				if let Some(tax) = self.read_i32(base + dataplane::layout::province::TAX) {
 					sum += tax as f64;
 					// Manpower is potential consumption: a large population
 					// represents purchasing power that tax alone understates.
 					// It joins the sink signal at half weight so tax stays
 					// the dominant expression of current wealth.
-					if let Some(man) = self.read_i32(base + layout::province::MANPOWER) {
+					if let Some(man) = self.read_i32(base + dataplane::layout::province::MANPOWER) {
 						manpower_sum += man as f64;
 					}
 					counted += 1.0;
@@ -274,49 +276,30 @@ impl LiveBackend {
 
 	/// Read an MSVC SSO string holding an internal key (`a-z0-9_`).
 	fn read_sso_key(&self, addr: usize) -> Option<String> {
-		let length = self.read_qword(addr + 0x10)? as usize;
-		if length == 0 || length > 64 {
-			return None;
-		}
-		let capacity = self.read_qword(addr + 0x18)?;
-		let data = if capacity > 0xF {
-			self.read_qword(addr)? as usize
-		} else {
-			addr
-		};
-		let mut bytes = Vec::with_capacity(length);
-		for i in 0..length {
-			let byte = self.read_i32(data + i)? as u8;
-			if !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && byte != b'_' {
-				return None;
-			}
-			bytes.push(byte);
-		}
-		String::from_utf8(bytes).ok()
+		dataplane::read_sso(&self.memory, addr, dataplane::is_key_byte)
 	}
 
 	fn read_qword(&self, addr: usize) -> Option<u64> {
-		(addr > 0x1_0000 && addr & 7 == 0).then(|| unsafe { std::ptr::read(addr as *const u64) })
+		self.memory.read_qword(addr)
 	}
 
 	fn read_i32(&self, addr: usize) -> Option<i32> {
-		(addr > 0x1_0000).then(|| unsafe { std::ptr::read_unaligned(addr as *const i32) })
+		self.memory.read_i32(addr)
 	}
 
 	/// One byte, for the SSO-string and route-byte walks: reading four
 	/// bytes where one is walked risks touching the page after the
 	/// object near a segment boundary.
 	fn read_u8(&self, addr: usize) -> Option<u8> {
-		(addr > 0x1_0000).then(|| unsafe { std::ptr::read(addr as *const u8) })
+		self.memory.read_u8(addr)
 	}
 
 	fn write_qword(&self, addr: usize, value: u64) -> Option<()> {
-		(addr > 0x1_0000 && addr & 7 == 0)
-			.then(|| unsafe { std::ptr::write(addr as *mut u64, value) })
+		self.memory.write_qword(addr, value)
 	}
 
 	fn write_i32(&self, addr: usize, value: i32) -> Option<()> {
-		(addr > 0x1_0000).then(|| unsafe { std::ptr::write_unaligned(addr as *mut i32, value) })
+		self.memory.write_i32(addr, value)
 	}
 
 	/// One-shot diagnostic: a few countries' tag and treasury, so the
@@ -326,7 +309,7 @@ impl LiveBackend {
 		if base <= 0x1_0000 {
 			return;
 		}
-		let manager_raw = self.read_qword(base + layout::COUNTRY_MANAGER_GLOBAL_RVA);
+		let manager_raw = self.read_qword(base + dataplane::layout::COUNTRY_MANAGER_GLOBAL_RVA);
 		crate::logging::write(
 			crate::logging::DEBUG,
 			&format!("country probe: manager global reads {manager_raw:?}"),
@@ -347,7 +330,7 @@ impl LiveBackend {
 			return;
 		};
 		let Some(pointers) = self
-			.read_qword(manager + layout::country_manager::INDEX_ARRAY)
+			.read_qword(manager + dataplane::layout::country_manager::INDEX_ARRAY)
 			.map(|p| p as usize)
 			.filter(|p| *p > 0x1_0000)
 		else {
@@ -363,7 +346,7 @@ impl LiveBackend {
 				continue;
 			};
 			let tag = self.read_tag(country);
-			let treasury = self.read_i32(country + layout::country::TREASURY);
+			let treasury = self.read_i32(country + dataplane::layout::country::TREASURY);
 			lines.push(format!("country {index} tag {tag} treasury {treasury:?}"));
 		}
 		crate::logging::write(
@@ -375,15 +358,7 @@ impl LiveBackend {
 	/// The tag embedded in a country's identity qword at +0x20: the low
 	/// bytes as ASCII, up to the first non-tag character.
 	fn read_tag(&self, country: usize) -> String {
-		let Some(packed) = self.read_qword(country + layout::country::TAG) else {
-			return "?".to_string();
-		};
-		let bytes = packed.to_le_bytes();
-		let len = bytes
-			.iter()
-			.position(|b| !b.is_ascii_uppercase() && !b.is_ascii_digit())
-			.unwrap_or(4);
-		String::from_utf8_lossy(&bytes[..len.min(4)]).into_owned()
+		dataplane::CountryView::tag_at(&self.memory, country)
 	}
 
 	/// The number of countries, from the country vector in the game
@@ -392,14 +367,12 @@ impl LiveBackend {
 		if self.context == 0 {
 			return None;
 		}
-		let count = self.read_i32(self.context + layout::COUNTRIES_COUNT)? as usize;
+		let count = self.read_i32(self.context + dataplane::layout::COUNTRIES_COUNT)? as usize;
 		(1..=1024).contains(&count).then_some(count)
 	}
 
 	fn write_bytes(&self, addr: usize, bytes: &[u8]) -> Option<()> {
-		(addr > 0x1_0000).then(|| unsafe {
-			std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len())
-		})
+		self.memory.write_bytes(addr, bytes)
 	}
 
 	/// Capture a node's vanilla routes and weights before the first
@@ -415,9 +388,9 @@ impl LiveBackend {
 			.definition_of(address)
 			.ok_or("implausible definition")?;
 		let (begin, end) = self.routes(def).ok_or("implausible route vector")?;
-		let count = (end - begin) / layout::route::SIZE;
-		let mut original_routes = Vec::with_capacity(count * layout::route::SIZE);
-		for offset in 0..count * layout::route::SIZE {
+		let count = (end - begin) / dataplane::layout::route::SIZE;
+		let mut original_routes = Vec::with_capacity(count * dataplane::layout::route::SIZE);
+		for offset in 0..count * dataplane::layout::route::SIZE {
 			let Some(byte) = self.read_i32(begin + offset) else {
 				return Err("route bytes unreadable");
 			};
@@ -427,10 +400,10 @@ impl LiveBackend {
 		// they do not, route reordering alone still holds and the weights
 		// keep their live order (the pairing diagnostic covers the case).
 		let weights_begin = self
-			.read_qword(address + layout::node::WEIGHTS)
+			.read_qword(address + dataplane::layout::node::WEIGHTS)
 			.map(|p| p as usize);
 		let weights_end = self
-			.read_qword(address + layout::node::WEIGHTS + 8)
+			.read_qword(address + dataplane::layout::node::WEIGHTS + 8)
 			.map(|p| p as usize);
 		let paired = matches!((weights_begin, weights_end), (Some(a), Some(e)) if e >= a && (e - a) / 4 == count);
 		let (weights_begin, original_weights) = if paired {
@@ -469,7 +442,7 @@ impl LiveBackend {
 		let Some(state) = self.mutations.get(&node) else {
 			return Ok(());
 		};
-		let stride = layout::route::SIZE;
+		let stride = dataplane::layout::route::SIZE;
 		let order = live_order(&state.closed);
 		for (live_slot, vanilla_slot) in order.iter().enumerate() {
 			let source = vanilla_slot * stride;
@@ -482,9 +455,8 @@ impl LiveBackend {
 				state.original_weights.get(*vanilla_slot).copied(),
 			) {
 				let Some(value) = value else { continue };
-				let addr = weights_begin + live_slot * 4;
-				(addr > 0x1_0000)
-					.then(|| unsafe { std::ptr::write_unaligned(addr as *mut i32, value) })
+				self.memory
+					.write_i32(weights_begin + live_slot * 4, value)
 					.ok_or("weight write refused")?;
 			}
 		}
@@ -495,18 +467,21 @@ impl LiveBackend {
 		// the observe-side permutation recovery.
 		let open_count = state.closed.iter().filter(|c| !**c).count();
 		let new_end = state.routes_begin + open_count * stride;
-		self.write_qword(state.def + layout::def::ROUTES_END, new_end as u64)
-			.ok_or("end write refused")?;
+		self.write_qword(
+			state.def + dataplane::layout::def::ROUTES_END,
+			new_end as u64,
+		)
+		.ok_or("end write refused")?;
 		Ok(())
 	}
 
 	fn node_count(&self) -> Option<usize> {
-		let count = self.read_i32(self.db + layout::db::NODE_COUNT)? as usize;
+		let count = self.read_i32(self.db + dataplane::layout::db::NODE_COUNT)? as usize;
 		(20..=512).contains(&count).then_some(count)
 	}
 
 	fn nodes_base(&self) -> Option<usize> {
-		let base = self.read_qword(self.db + layout::db::NODES)? as usize;
+		let base = self.read_qword(self.db + dataplane::layout::db::NODES)? as usize;
 		(base > 0x1_0000 && base & 7 == 0).then_some(base)
 	}
 
@@ -519,21 +494,21 @@ impl LiveBackend {
 	}
 
 	fn definition_of(&self, node: usize) -> Option<usize> {
-		let def = self.read_qword(node + layout::node::DEFINITION)? as usize;
+		let def = self.read_qword(node + dataplane::layout::node::DEFINITION)? as usize;
 		(def > 0x1_0000 && def & 7 == 0).then_some(def)
 	}
 
 	/// MSVC SSO `std::string`: inline buffer unless capacity exceeds 0xF.
 	fn read_name(&self, def: usize) -> Option<String> {
-		let capacity = self.read_qword(def + layout::def::NAME + 0x18)?;
-		let length = self.read_qword(def + layout::def::NAME + 0x10)? as usize;
+		let capacity = self.read_qword(def + dataplane::layout::def::NAME + 0x18)?;
+		let length = self.read_qword(def + dataplane::layout::def::NAME + 0x10)? as usize;
 		if length == 0 || length > 64 {
 			return None;
 		}
 		let data = if capacity > 0xF {
-			self.read_qword(def + layout::def::NAME)? as usize
+			self.read_qword(def + dataplane::layout::def::NAME)? as usize
 		} else {
-			def + layout::def::NAME
+			def + dataplane::layout::def::NAME
 		};
 		let mut bytes = Vec::with_capacity(length);
 		for i in 0..length {
@@ -550,12 +525,15 @@ impl LiveBackend {
 	/// nodes have no outgoing routes at all (`begin == end`, both null in
 	/// a default-constructed MSVC vector).
 	fn routes(&self, def: usize) -> Option<(usize, usize)> {
-		let begin = self.read_qword(def + layout::def::ROUTES)? as usize;
-		let end = self.read_qword(def + layout::def::ROUTES_END)? as usize;
+		let begin = self.read_qword(def + dataplane::layout::def::ROUTES)? as usize;
+		let end = self.read_qword(def + dataplane::layout::def::ROUTES_END)? as usize;
 		if begin == end {
 			return Some((begin, end));
 		}
-		if begin == 0 || end < begin || !(end - begin).is_multiple_of(layout::route::SIZE) {
+		if begin == 0
+			|| end < begin
+			|| !(end - begin).is_multiple_of(dataplane::layout::route::SIZE)
+		{
 			return None;
 		}
 		Some((begin, end))
@@ -612,9 +590,10 @@ impl EngineBackend for LiveBackend {
 					return Err("implausible route vector");
 				};
 				let outgoing: Vec<u32> = (begin..end)
-					.step_by(layout::route::SIZE)
+					.step_by(dataplane::layout::route::SIZE)
 					.filter_map(|slot| {
-						let target = self.read_qword(slot + layout::route::TARGET)? as usize;
+						let target =
+							self.read_qword(slot + dataplane::layout::route::TARGET)? as usize;
 						index_by_def.get(&target).copied()
 					})
 					.collect();
@@ -635,7 +614,7 @@ impl EngineBackend for LiveBackend {
 			let Some((begin, end)) = self.routes(def) else {
 				return Err("implausible route vector");
 			};
-			let route_count = (end - begin) / layout::route::SIZE;
+			let route_count = (end - begin) / dataplane::layout::route::SIZE;
 			// After mutations the live vector holds exactly the open
 			// entries; a drift from the plugin's own closed flags would
 			// mean an external writer touched the topology.
@@ -655,10 +634,10 @@ impl EngineBackend for LiveBackend {
 			// a pinned fact: log the first mismatch as a diagnostic and
 			// keep observing, so a live session tells us the real shape.
 			let weights = self
-				.read_qword(node + layout::node::WEIGHTS)
+				.read_qword(node + dataplane::layout::node::WEIGHTS)
 				.ok_or("implausible weights vector")? as usize;
 			let weights_end = self
-				.read_qword(node + layout::node::WEIGHTS + 8)
+				.read_qword(node + dataplane::layout::node::WEIGHTS + 8)
 				.ok_or("implausible weights vector")? as usize;
 			if !self.pairing_logged
 				&& (weights_end < weights || (weights_end - weights) / 4 != route_count)
@@ -680,11 +659,11 @@ impl EngineBackend for LiveBackend {
 				for probe in 0..count.min(3) {
 					let node = self.node_at(probe).expect("validated above");
 					let def = self.definition_of(node).expect("validated above");
-					let routes_begin = self.read_qword(def + layout::def::ROUTES);
-					let routes_end = self.read_qword(def + layout::def::ROUTES_END);
-					let routes_cap = self.read_qword(def + layout::def::ROUTES_END + 8);
+					let routes_begin = self.read_qword(def + dataplane::layout::def::ROUTES);
+					let routes_end = self.read_qword(def + dataplane::layout::def::ROUTES_END);
+					let routes_cap = self.read_qword(def + dataplane::layout::def::ROUTES_END + 8);
 					let name_bytes = (0..16)
-						.filter_map(|i| self.read_i32(def + layout::def::NAME + i))
+						.filter_map(|i| self.read_i32(def + dataplane::layout::def::NAME + i))
 						.map(|v| v as u8)
 						.take_while(|b| *b != 0)
 						.collect::<Vec<u8>>();
@@ -711,11 +690,11 @@ impl EngineBackend for LiveBackend {
 			// outgoing list.
 			let mut steering = vec![0.0_f64; outgoing.len()];
 			if let Some(begin) = self
-				.read_qword(node + layout::node::WEIGHTS)
+				.read_qword(node + dataplane::layout::node::WEIGHTS)
 				.map(|p| p as usize)
 			{
 				let end = self
-					.read_qword(node + layout::node::WEIGHTS + 8)
+					.read_qword(node + dataplane::layout::node::WEIGHTS + 8)
 					.map(|p| p as usize)
 					.unwrap_or(begin);
 				let live_count = end.saturating_sub(begin) / 4;
@@ -737,8 +716,12 @@ impl EngineBackend for LiveBackend {
 			// transferred), from the live node after the monthly update.
 			// This is what the game's mechanics (trade power shares,
 			// merchant modes) actually compute — no artificial formula.
-			let retained_value = self.read_i32(node + layout::node::VALUE).unwrap_or(0) as f64;
-			let transferred = self.read_i32(node + layout::node::TRANSFERRED).unwrap_or(0) as f64;
+			let retained_value = self
+				.read_i32(node + dataplane::layout::node::VALUE)
+				.unwrap_or(0) as f64;
+			let transferred = self
+				.read_i32(node + dataplane::layout::node::TRANSFERRED)
+				.unwrap_or(0) as f64;
 			let retention = if retained_value + transferred > 0.0 {
 				retained_value / (retained_value + transferred)
 			} else {
@@ -748,8 +731,12 @@ impl EngineBackend for LiveBackend {
 				id: index as u32,
 				tax: self.node_tax.get(&(index as u32)).copied().unwrap_or(0.0),
 				retention,
-				production: self.read_i32(node + layout::node::LOCAL_VALUE).unwrap_or(0) as f64,
-				trade_power: self.read_i32(node + layout::node::POWER).unwrap_or(0) as f64,
+				production: self
+					.read_i32(node + dataplane::layout::node::LOCAL_VALUE)
+					.unwrap_or(0) as f64,
+				trade_power: self
+					.read_i32(node + dataplane::layout::node::POWER)
+					.unwrap_or(0) as f64,
 				current_value: retained_value,
 				outgoing,
 				steering,
@@ -778,7 +765,7 @@ impl EngineBackend for LiveBackend {
 				let Some(probe_node) = self.node_at(probe) else {
 					continue;
 				};
-				let value = self.read_i32(probe_node + layout::node::VALUE);
+				let value = self.read_i32(probe_node + dataplane::layout::node::VALUE);
 				let c8 = self.read_i32(probe_node + 0xc8);
 				let d0 = self.read_i32(probe_node + 0xd0);
 				let d8 = self.read_i32(probe_node + 0xd8);
@@ -851,7 +838,7 @@ impl EngineBackend for LiveBackend {
 			return Vec::new();
 		};
 		let Some(table) = self
-			.read_qword(node_ptr + layout::node::ENTRY_TABLE)
+			.read_qword(node_ptr + dataplane::layout::node::ENTRY_TABLE)
 			.map(|p| p as usize)
 			.filter(|p| *p > 0x1_0000)
 		else {
@@ -863,8 +850,8 @@ impl EngineBackend for LiveBackend {
 		}
 		let mut participants = Vec::new();
 		for index in 0..count {
-			let entry = table + index * layout::node::ENTRY_SIZE;
-			match self.read_i32(entry + layout::entry::POWER) {
+			let entry = table + index * dataplane::layout::node::ENTRY_SIZE;
+			match self.read_i32(entry + dataplane::layout::entry::POWER) {
 				Some(power) if power > 0 => {
 					participants.push((index as u32, power as f64));
 				}
@@ -882,12 +869,12 @@ impl EngineBackend for LiveBackend {
 			return Err("no exe base");
 		}
 		let manager = self
-			.read_qword(base + layout::COUNTRY_MANAGER_GLOBAL_RVA)
+			.read_qword(base + dataplane::layout::COUNTRY_MANAGER_GLOBAL_RVA)
 			.map(|p| p as usize)
 			.filter(|p| *p > 0x1_0000)
 			.ok_or("implausible country manager")?;
 		let pointers = self
-			.read_qword(manager + layout::country_manager::INDEX_ARRAY)
+			.read_qword(manager + dataplane::layout::country_manager::INDEX_ARRAY)
 			.map(|p| p as usize)
 			.filter(|p| *p > 0x1_0000)
 			.ok_or("implausible country array")?;
@@ -897,27 +884,30 @@ impl EngineBackend for LiveBackend {
 			.filter(|p| *p > 0x1_0000)
 			.ok_or("implausible country pointer")?;
 		let treasury = self
-			.read_i32(country_ptr + layout::country::TREASURY)
+			.read_i32(country_ptr + dataplane::layout::country::TREASURY)
 			.ok_or("treasury unreadable")? as i64;
 		// The amounts arrive as engine thousandths; the treasury field's
 		// own unit is the same thousandths-of-a-ducat scale the trade
 		// values use, so the add is direct.
 		let updated = (treasury + amount.round() as i64).clamp(
-			-layout::country::TREASURY_CLAMP,
-			layout::country::TREASURY_CLAMP,
+			-dataplane::layout::country::TREASURY_CLAMP,
+			dataplane::layout::country::TREASURY_CLAMP,
 		);
-		self.write_i32(country_ptr + layout::country::TREASURY, updated as i32)
-			.ok_or("treasury write refused")?;
+		self.write_i32(
+			country_ptr + dataplane::layout::country::TREASURY,
+			updated as i32,
+		)
+		.ok_or("treasury write refused")?;
 		// Refresh the player's treasury label, as ChangeTreasury does.
 		if let Some(controller) = self
-			.read_qword(self.context + layout::ui::CONTROLLER)
+			.read_qword(self.context + dataplane::layout::ui::CONTROLLER)
 			.map(|p| p as usize)
 			.filter(|p| *p > 0x1_0000)
-			&& let Some(flags) = self.read_i32(controller + layout::ui::FLAGS)
+			&& let Some(flags) = self.read_i32(controller + dataplane::layout::ui::FLAGS)
 		{
 			let _ = self.write_i32(
-				controller + layout::ui::FLAGS,
-				flags | layout::ui::TREASURY_DIRTY,
+				controller + dataplane::layout::ui::FLAGS,
+				flags | dataplane::layout::ui::TREASURY_DIRTY,
 			);
 		}
 		Ok(())
@@ -943,7 +933,7 @@ impl EngineBackend for LiveBackend {
 
 #[cfg(test)]
 mod tests {
-	use super::{LiveBackend, live_order, parse_members};
+	use super::parse_members;
 
 	#[test]
 	fn members_parse_into_keys_and_province_ids() {
@@ -977,75 +967,5 @@ only-a-key"
 			parse_members(b"cape 12 oh-no 13"),
 			vec![("cape".to_string(), vec![12, 13])]
 		);
-	}
-
-	/// Build a fake in-process object so the pointer-walking readers can be
-	/// tested against real (aligned, plausible) addresses.
-	fn scratch(qwords: usize) -> (Vec<u64>, usize) {
-		let mut buffer = vec![0_u64; qwords];
-		let address = buffer.as_mut_ptr() as usize;
-		buffer[0] = address as u64; // self-pointer handy for SSO data
-		(buffer, address)
-	}
-
-	#[test]
-	fn sso_keys_read_inline_and_pointer_forms() {
-		let backend = LiveBackend::new();
-		// Inline: capacity <= 0xF keeps the bytes inside the object.
-		let (mut buffer, address) = scratch(6);
-		buffer[0] = u64::from_le_bytes(*b"zanzibar");
-		buffer[1] = 0;
-		buffer[2] = 8; // length at +0x10
-		buffer[3] = 0xF; // capacity at +0x18
-		assert_eq!(backend.read_sso_key(address).as_deref(), Some("zanzibar"));
-		// Pointer: capacity > 0xF dereferences the first qword, here
-		// aimed at the key bytes living later in the same allocation.
-		let (mut buffer, address) = scratch(6);
-		let data = address + 8 * 5;
-		buffer[0] = data as u64;
-		buffer[2] = 4;
-		buffer[3] = 0x1F;
-		buffer[5] = u64::from_le_bytes(*b"siamxxxx");
-		assert_eq!(backend.read_sso_key(address).as_deref(), Some("siam"));
-	}
-
-	#[test]
-	fn sso_keys_reject_implausible_lengths_and_charset() {
-		let backend = LiveBackend::new();
-		let (mut buffer, address) = scratch(6);
-		buffer[2] = 65; // length beyond the documented key range
-		buffer[3] = 0xF;
-		assert_eq!(backend.read_sso_key(address), None);
-		buffer[2] = 4;
-		buffer[0] = u64::from_le_bytes([b'U', b'P', b'P', b'E', 0, 0, 0, 0]);
-		// Uppercase is not the internal-key charset.
-		assert_eq!(backend.read_sso_key(address), None);
-	}
-
-	#[test]
-	fn tags_unpack_from_the_identity_qword() {
-		let backend = LiveBackend::new();
-		let (mut buffer, address) = scratch(8);
-		// tag in the low bytes, country index in bits 32..48.
-		buffer[4] = u64::from_le_bytes([b'S', b'W', b'E', 0, 4, 0, 0, 0]);
-		assert_eq!(backend.read_tag(address), "SWE");
-		// An implausible address falls back to the question mark rather
-		// than panicking.
-		assert_eq!(backend.read_tag(0), "?");
-	}
-
-	#[test]
-	fn open_entries_stay_first_in_vanilla_order() {
-		assert_eq!(live_order(&[false, false]), vec![0, 1]);
-		// Closing the middle of three parks vanilla slot 1 at the tail.
-		assert_eq!(live_order(&[false, true, false]), vec![0, 2, 1]);
-		// Closed slots keep their vanilla order at the tail.
-		assert_eq!(live_order(&[true, true]), vec![0, 1]);
-		assert_eq!(live_order(&[true, false, true]), vec![1, 0, 2]);
-	}
-
-	#[test]
-	fn an_empty_node_has_an_empty_order() {
-		assert!(live_order(&[]).is_empty());
 	}
 }
