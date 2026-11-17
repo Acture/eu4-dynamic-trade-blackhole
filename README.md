@@ -67,7 +67,7 @@ From the Foch checkout root:
 
 ```powershell
 git submodule update --init
-cargo build -p foch-plugin-trade-blackhole -p foch-eu4-host -p foch-cli --release --locked
+cargo build -p foch-plugin-trade-blackhole -p foch-runtime -p foch-cli --release --locked
 uv run python -I plugins/eu4-dynamic-trade-blackhole/tools/assemble_pkg.py
 foch plugin import ./target/plugin-pkg
 foch plugin enable Acture/eu4-dynamic-trade-blackhole --playset default
@@ -118,8 +118,11 @@ Monthly, on the game thread, inside the economy-update hook:
    holders by share, written to the countries' treasuries through the
    same path the game's own `ChangeTreasury` uses.
 
-Engine internals, the reverse-engineering record, and the historical
-acceptance runs live in [`docs/internals.md`](docs/internals.md). The
+The next mechanics — world entrepôts, chartered factories, the route
+gazetteer, privateering cuts — are designed in
+[`docs/design.md`](docs/design.md) (Chinese). Engine internals, the
+reverse-engineering record, and the historical acceptance runs live in
+[`docs/internals.md`](docs/internals.md). The
 automated end-to-end harness is `tests/e2e-mod/` (run via
 `foch test --with-plugins`, each case its own real 800-day session).
 
