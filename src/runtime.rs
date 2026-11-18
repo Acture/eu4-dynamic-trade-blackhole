@@ -294,12 +294,20 @@ impl LiveBackend {
 		self.memory.read_u8(addr)
 	}
 
-	fn write_qword(&self, addr: usize, value: u64) -> Option<()> {
-		self.memory.write_qword(addr, value)
+	/// # Safety
+	///
+	/// Same contract as [`foch_runtime::dataplane::Memory::write_qword`]:
+	/// an engine-owned target no Rust object aliases, on the game thread.
+	unsafe fn write_qword(&self, addr: usize, value: u64) -> Option<()> {
+		unsafe { self.memory.write_qword(addr, value) }
 	}
 
-	fn write_i32(&self, addr: usize, value: i32) -> Option<()> {
-		self.memory.write_i32(addr, value)
+	/// # Safety
+	///
+	/// Same contract as [`Memory::write_qword`]: an engine-owned target,
+	/// no Rust alias, game thread.
+	unsafe fn write_i32(&self, addr: usize, value: i32) -> Option<()> {
+		unsafe { self.memory.write_i32(addr, value) }
 	}
 
 	/// One-shot diagnostic: a few countries' tag and treasury, so the
@@ -371,8 +379,12 @@ impl LiveBackend {
 		(1..=1024).contains(&count).then_some(count)
 	}
 
-	fn write_bytes(&self, addr: usize, bytes: &[u8]) -> Option<()> {
-		self.memory.write_bytes(addr, bytes)
+	/// # Safety
+	///
+	/// Same contract as [`Memory::write_qword`]: an engine-owned target,
+	/// no Rust alias, game thread.
+	unsafe fn write_bytes(&self, addr: usize, bytes: &[u8]) -> Option<()> {
+		unsafe { self.memory.write_bytes(addr, bytes) }
 	}
 
 	/// Capture a node's vanilla routes and weights before the first
@@ -444,20 +456,27 @@ impl LiveBackend {
 		};
 		let stride = dataplane::layout::route::SIZE;
 		let order = live_order(&state.closed);
-		for (live_slot, vanilla_slot) in order.iter().enumerate() {
-			let source = vanilla_slot * stride;
-			let target = state.routes_begin + live_slot * stride;
-			let bytes = &state.original_routes[source..source + stride];
-			self.write_bytes(target, bytes)
-				.ok_or("route write refused")?;
-			if let (Some(weights_begin), value) = (
-				state.weights_begin,
-				state.original_weights.get(*vanilla_slot).copied(),
-			) {
-				let Some(value) = value else { continue };
-				self.memory
-					.write_i32(weights_begin + live_slot * 4, value)
-					.ok_or("weight write refused")?;
+		// SAFETY: every target below was captured from the engine's own
+		// route and steering vectors before the first mutation (never
+		// caller-supplied), the writes stay inside the captured original
+		// capacity, and the whole detour runs on the game thread inside
+		// the monthly hook where the route tables are stable.
+		unsafe {
+			for (live_slot, vanilla_slot) in order.iter().enumerate() {
+				let source = vanilla_slot * stride;
+				let target = state.routes_begin + live_slot * stride;
+				let bytes = &state.original_routes[source..source + stride];
+				self.write_bytes(target, bytes)
+					.ok_or("route write refused")?;
+				if let (Some(weights_begin), value) = (
+					state.weights_begin,
+					state.original_weights.get(*vanilla_slot).copied(),
+				) {
+					let Some(value) = value else { continue };
+					self.memory
+						.write_i32(weights_begin + live_slot * 4, value)
+						.ok_or("weight write refused")?;
+				}
 			}
 		}
 		// The paired steering-weight vector's end is left untouched: the
@@ -467,10 +486,14 @@ impl LiveBackend {
 		// the observe-side permutation recovery.
 		let open_count = state.closed.iter().filter(|c| !**c).count();
 		let new_end = state.routes_begin + open_count * stride;
-		self.write_qword(
-			state.def + dataplane::layout::def::ROUTES_END,
-			new_end as u64,
-		)
+		// SAFETY: the route vector's own end field on the same captured
+		// engine definition, same thread contract as the loop above.
+		unsafe {
+			self.write_qword(
+				state.def + dataplane::layout::def::ROUTES_END,
+				new_end as u64,
+			)
+		}
 		.ok_or("end write refused")?;
 		Ok(())
 	}
@@ -893,10 +916,15 @@ impl EngineBackend for LiveBackend {
 			-dataplane::layout::country::TREASURY_CLAMP,
 			dataplane::layout::country::TREASURY_CLAMP,
 		);
-		self.write_i32(
-			country_ptr + dataplane::layout::country::TREASURY,
-			updated as i32,
-		)
+		// SAFETY: the target is the engine's treasury field reached
+		// through the validated country registry — no Rust object
+		// aliases it — and this runs on the game thread.
+		unsafe {
+			self.write_i32(
+				country_ptr + dataplane::layout::country::TREASURY,
+				updated as i32,
+			)
+		}
 		.ok_or("treasury write refused")?;
 		// Refresh the player's treasury label, as ChangeTreasury does.
 		if let Some(controller) = self
@@ -905,10 +933,14 @@ impl EngineBackend for LiveBackend {
 			.filter(|p| *p > 0x1_0000)
 			&& let Some(flags) = self.read_i32(controller + dataplane::layout::ui::FLAGS)
 		{
-			let _ = self.write_i32(
-				controller + dataplane::layout::ui::FLAGS,
-				flags | dataplane::layout::ui::TREASURY_DIRTY,
-			);
+			// SAFETY: the UI controller's flag word, same provenance and
+			// thread contract as the treasury write above.
+			let _ = unsafe {
+				self.write_i32(
+					controller + dataplane::layout::ui::FLAGS,
+					flags | dataplane::layout::ui::TREASURY_DIRTY,
+				)
+			};
 		}
 		Ok(())
 	}
