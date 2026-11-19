@@ -65,6 +65,42 @@ fn parse_members(bytes: &[u8]) -> Vec<(String, Vec<u32>)> {
 	out
 }
 
+/// Where a node's member-province list came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemberSource {
+	/// `NodeView::member_provinces`: `CTradeNodeDefinition + def::MEMBERS`
+	/// (`0x50`). Statically identified for EU4 1.37.5; pending live verification.
+	LiveVector,
+	/// Offline `node_members.txt` from `tools/gen_members.py`.
+	StaticTable,
+}
+
+/// Prefer the live member vector. `None` or an empty vector falls back to
+/// the offline table; an empty table entry is not a usable member list.
+fn resolve_members(
+	live: Option<&[u32]>,
+	static_ids: Option<&[u32]>,
+) -> Option<(MemberSource, Vec<u32>)> {
+	if let Some(ids) = live.filter(|ids| !ids.is_empty()) {
+		return Some((MemberSource::LiveVector, ids.to_vec()));
+	}
+	static_ids
+		.filter(|ids| !ids.is_empty())
+		.map(|ids| (MemberSource::StaticTable, ids.to_vec()))
+}
+
+fn member_source_summary(
+	covered: usize,
+	count: usize,
+	live_nodes: usize,
+	static_nodes: usize,
+) -> String {
+	format!(
+		"tax aggregated for {covered}/{count} nodes; member source: {live_nodes} live vector (CTradeNodeDefinition+0x{:x}, statically identified, pending live verification), {static_nodes} static node_members.txt",
+		dataplane::layout::def::MEMBERS,
+	)
+}
+
 /// One economy-update step on the game thread. `context` is the hook's
 /// first argument and `db` the embedded trade database; both are validated
 /// against the context global before the engine touches anything.
@@ -144,6 +180,7 @@ pub struct LiveBackend {
 	members_warned: bool,
 	/// Offline node-members table: internal key -> member province ids,
 	/// shipped in the plugin package (generated from 00_tradenodes.txt).
+	/// Used when the live member vector is missing or empty.
 	member_ids: HashMap<String, Vec<u32>>,
 	/// Per-node-index sink signal, built at the first observe from the
 	/// members' CProvince base tax: the per-province mean or the sum.
@@ -181,17 +218,17 @@ impl LiveBackend {
 	}
 
 	/// Sum the members' base tax for every node, once the province array
-	/// and the key->definition mapping are available. A node's internal
-	/// key is read from any incoming route entry (the entry carries the
-	/// target's key), so no localization-dependent name is involved.
+	/// is available. Member provinces come from the live
+	/// `CTradeNodeDefinition + def::MEMBERS` vector (`0x50`,
+	/// `std::vector<i32>`, statically identified for EU4 1.37.5 and still
+	/// pending a live Foch session) via [`dataplane::NodeView::member_provinces`].
+	/// `None` or an empty vector falls back to the offline `node_members.txt`
+	/// table, whose keys are read from incoming route entries.
 	fn aggregate_taxes(&mut self, count: usize) {
 		// Re-aggregate every 6 months alongside the evidence window:
 		// province development changes tax and manpower, and the sink
 		// signal must track it.
 		if !self.node_tax.is_empty() && !self.observes.is_multiple_of(6) {
-			return;
-		}
-		if self.member_ids.is_empty() {
 			return;
 		}
 		self.node_tax.clear();
@@ -203,50 +240,60 @@ impl LiveBackend {
 			return;
 		};
 		// Route entries name their target: entry+0x10 holds the target's
-		// internal key, entry+0x30 the target definition pointer.
+		// internal key, entry+0x30 the target definition pointer. The
+		// offline table is the only consumer; skip the walk when it is absent.
 		let mut key_by_def: HashMap<usize, String> = HashMap::new();
-		for index in 0..count {
-			let Some(node) = self.node_at(index) else {
-				continue;
-			};
-			let Some(def) = self.definition_of(node) else {
-				continue;
-			};
-			let Some((begin, end)) = self.routes(def) else {
-				continue;
-			};
-			for slot in (begin..end).step_by(dataplane::layout::route::SIZE) {
-				let Some(target) = self
-					.read_qword(slot + dataplane::layout::route::TARGET)
-					.map(|p| p as usize)
-				else {
+		if !self.member_ids.is_empty() {
+			for index in 0..count {
+				let Some(node) = self.node_at(index) else {
 					continue;
 				};
-				if key_by_def.contains_key(&target) {
+				let Some(def) = self.definition_of(node) else {
 					continue;
-				}
-				if let Some(key) = self.read_sso_key(slot + 0x10) {
-					key_by_def.insert(target, key);
+				};
+				let Some((begin, end)) = self.routes(def) else {
+					continue;
+				};
+				for slot in (begin..end).step_by(dataplane::layout::route::SIZE) {
+					let Some(target) = self
+						.read_qword(slot + dataplane::layout::route::TARGET)
+						.map(|p| p as usize)
+					else {
+						continue;
+					};
+					if key_by_def.contains_key(&target) {
+						continue;
+					}
+					if let Some(key) = self.read_sso_key(slot + 0x10) {
+						key_by_def.insert(target, key);
+					}
 				}
 			}
 		}
+		// `def::MEMBERS` (`0x50`) is a static identification, pending live
+		// verification. An empty or unreadable vector is not a member list:
+		// fall back to `node_members.txt` for that node.
+		let trade = self.eu4().trade_nodes();
+		let mut live_nodes = 0usize;
+		let mut static_nodes = 0usize;
 		for index in 0..count {
-			let Some(node) = self.node_at(index) else {
+			let live = trade.as_ref().and_then(|nodes| {
+				let view = nodes.node(index)?;
+				view.member_provinces()
+			});
+			let static_ids = self.static_member_ids(index, &key_by_def);
+			let Some((source, ids)) = resolve_members(live.as_deref(), static_ids.as_deref())
+			else {
 				continue;
 			};
-			let Some(def) = self.definition_of(node) else {
-				continue;
-			};
-			let Some(key) = key_by_def.get(&def) else {
-				continue;
-			};
-			let Some(ids) = self.member_ids.get(key) else {
-				continue;
-			};
+			match source {
+				MemberSource::LiveVector => live_nodes += 1,
+				MemberSource::StaticTable => static_nodes += 1,
+			}
 			let mut sum = 0.0;
 			let mut manpower_sum = 0.0;
 			let mut counted = 0.0;
-			for id in ids {
+			for id in &ids {
 				let base = cprov_base + *id as usize * dataplane::layout::province::CPROVINCE_SIZE;
 				if let Some(tax) = self.read_i32(base + dataplane::layout::province::TAX) {
 					sum += tax as f64;
@@ -273,7 +320,7 @@ impl LiveBackend {
 		}
 		crate::logging::write(
 			crate::logging::INFO,
-			&format!("tax aggregated for {}/{} nodes", self.node_tax.len(), count),
+			&member_source_summary(self.node_tax.len(), count, live_nodes, static_nodes),
 		);
 		// A modded trade map replaces the nodes the offline members
 		// table was built from: tax coverage collapses while the rest of
@@ -289,6 +336,20 @@ impl LiveBackend {
 				),
 			);
 		}
+	}
+
+	/// The offline table row for one node. The key is the definition
+	/// pointer an incoming route recorded; missing when that route or
+	/// the table row is absent.
+	fn static_member_ids(
+		&self,
+		index: usize,
+		key_by_def: &HashMap<usize, String>,
+	) -> Option<Vec<u32>> {
+		let node = self.node_at(index)?;
+		let def = self.definition_of(node)?;
+		let key = key_by_def.get(&def)?;
+		self.member_ids.get(key).cloned()
 	}
 
 	/// Read an MSVC SSO string holding an internal key (`a-z0-9_`).
@@ -387,13 +448,23 @@ impl LiveBackend {
 	}
 
 	/// The number of countries, from the country vector in the game
-	/// context: the same begin/count pair the distribution loop reads.
+	/// context: the same count [`dataplane::Eu4Game::countries`] accepts
+	/// (`1..=i16::MAX`).
 	fn country_count(&self) -> Option<usize> {
 		if self.context == 0 {
 			return None;
 		}
-		let count = self.read_i32(self.context + dataplane::layout::COUNTRIES_COUNT)? as usize;
-		(1..=1024).contains(&count).then_some(count)
+		let raw = self.read_i32(self.context + dataplane::layout::COUNTRIES_COUNT)?;
+		let count = usize::try_from(raw).ok()?;
+		(1..=i16::MAX as usize).contains(&count).then_some(count)
+	}
+
+	fn eu4(&self) -> dataplane::Eu4Game {
+		dataplane::Eu4Game {
+			memory: self.memory,
+			exe_base: EXE_BASE.load(Ordering::Acquire),
+			context: self.context,
+		}
 	}
 
 	/// # Safety
@@ -515,9 +586,18 @@ impl LiveBackend {
 		Ok(())
 	}
 
+	/// Trade-node count through [`dataplane::Eu4Game::trade_nodes`].
+	///
+	/// The shared gate is `1..=MAX_TRADE_NODES` (4096). Counts below 20
+	/// (small regional maps) and above 512 (total conversions) stay valid;
+	/// only zero, negative, and clearly corrupt counts are rejected.
 	fn node_count(&self) -> Option<usize> {
-		let count = self.read_i32(self.db + dataplane::layout::db::NODE_COUNT)? as usize;
-		(20..=512).contains(&count).then_some(count)
+		let embedded = self.context.checked_add(dataplane::layout::DB_IN_CONTEXT)?;
+		if self.db != embedded {
+			return None;
+		}
+		let count = self.eu4().trade_nodes()?.count();
+		(count <= dataplane::game::MAX_TRADE_NODES).then_some(count)
 	}
 
 	fn nodes_base(&self) -> Option<usize> {
@@ -885,7 +965,7 @@ impl EngineBackend for LiveBackend {
 			return Vec::new();
 		};
 		let count = self.country_count().unwrap_or(0);
-		if count == 0 || count > 1024 {
+		if count == 0 {
 			return Vec::new();
 		}
 		let mut participants = Vec::new();
@@ -982,7 +1062,13 @@ impl EngineBackend for LiveBackend {
 
 #[cfg(test)]
 mod tests {
-	use super::parse_members;
+	#[cfg(windows)]
+	use super::LiveBackend;
+	use super::{MemberSource, member_source_summary, parse_members, resolve_members};
+	#[cfg(windows)]
+	use crate::config::SinkBasis;
+	#[cfg(windows)]
+	use foch_runtime::dataplane;
 
 	#[test]
 	fn members_parse_into_keys_and_province_ids() {
@@ -1016,5 +1102,301 @@ only-a-key"
 			parse_members(b"cape 12 oh-no 13"),
 			vec![("cape".to_string(), vec![12, 13])]
 		);
+	}
+
+	#[test]
+	fn live_member_vector_beats_the_static_table() {
+		let static_ids = [9, 10];
+		let (source, ids) = resolve_members(Some(&[1, 2]), Some(&static_ids)).unwrap();
+		assert_eq!(source, MemberSource::LiveVector);
+		assert_eq!(ids, vec![1, 2]);
+		let (source, ids) = resolve_members(Some(&[1]), None).unwrap();
+		assert_eq!(source, MemberSource::LiveVector);
+		assert_eq!(ids, vec![1]);
+	}
+
+	#[test]
+	fn empty_or_missing_live_vector_falls_back_to_node_members() {
+		let static_ids = [12, 13];
+		let missing_or_empty: [Option<&[u32]>; 2] = [None, Some(&[])];
+		for live in missing_or_empty {
+			let (source, ids) = resolve_members(live, Some(&static_ids)).unwrap();
+			assert_eq!(source, MemberSource::StaticTable);
+			assert_eq!(ids, vec![12, 13]);
+		}
+		assert_eq!(resolve_members(None, None), None);
+		assert_eq!(resolve_members(Some(&[]), Some(&[])), None);
+		assert_eq!(resolve_members(Some(&[]), None), None);
+	}
+
+	#[test]
+	fn member_source_log_names_the_static_offset_and_which_table_won() {
+		let text = member_source_summary(2, 3, 1, 1);
+		assert!(text.contains("2/3"));
+		assert!(text.contains("1 live vector"));
+		assert!(text.contains("1 static node_members.txt"));
+		assert!(text.contains("0x50"));
+		assert!(text.contains("pending live verification"));
+	}
+
+	/// A context-sized buffer whose embedded trade database reports `count`.
+	/// The node-array pointer aims at the buffer itself: `trade_nodes` only
+	/// requires it to be a plausible aligned address.
+	#[cfg(windows)]
+	struct CountFixture {
+		context: Vec<u64>,
+	}
+
+	#[cfg(windows)]
+	impl CountFixture {
+		fn nodes(count: i32) -> Self {
+			Self::write_count(
+				dataplane::layout::DB_IN_CONTEXT + dataplane::layout::db::NODE_COUNT,
+				count,
+				true,
+			)
+		}
+
+		fn countries(count: i32) -> Self {
+			Self::write_count(dataplane::layout::COUNTRIES_COUNT, count, false)
+		}
+
+		fn write_count(offset: usize, count: i32, point_nodes_at_self: bool) -> Self {
+			let bytes = offset + 4;
+			let mut context = vec![0_u64; bytes.div_ceil(8)];
+			let base = context.as_mut_ptr() as usize;
+			unsafe {
+				if point_nodes_at_self {
+					let nodes =
+						base + dataplane::layout::DB_IN_CONTEXT + dataplane::layout::db::NODES;
+					std::ptr::write_unaligned(nodes as *mut u64, base as u64);
+				}
+				std::ptr::write_unaligned((base + offset) as *mut i32, count);
+			}
+			Self { context }
+		}
+
+		fn context(&self) -> usize {
+			self.context.as_ptr() as usize
+		}
+	}
+
+	#[cfg(windows)]
+	fn backend_on(fixture: &CountFixture) -> LiveBackend {
+		let mut backend = LiveBackend::new();
+		backend.context = fixture.context();
+		backend.db = fixture.context() + dataplane::layout::DB_IN_CONTEXT;
+		backend
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn node_count_accepts_regional_and_overhaul_maps() {
+		// The retired gate was `20..=512`. Shared `Eu4Game::trade_nodes`
+		// accepts `1..=MAX_TRADE_NODES`; country counts use `1..=i16::MAX`.
+		let ceiling = dataplane::game::MAX_TRADE_NODES;
+		for count in [1, 5, 19, 20, 512, 513, 1024, ceiling as i32] {
+			let fixture = CountFixture::nodes(count);
+			assert_eq!(
+				backend_on(&fixture).node_count(),
+				Some(count as usize),
+				"count {count}"
+			);
+		}
+		for count in [0, -1, ceiling as i32 + 1] {
+			let fixture = CountFixture::nodes(count);
+			assert_eq!(backend_on(&fixture).node_count(), None, "count {count}");
+		}
+
+		let wide = CountFixture::countries(1500);
+		assert_eq!(backend_on(&wide).country_count(), Some(1500));
+		let at_cap = CountFixture::countries(i16::MAX as i32);
+		assert_eq!(backend_on(&at_cap).country_count(), Some(i16::MAX as usize));
+		let over = CountFixture::countries(i16::MAX as i32 + 1);
+		assert_eq!(backend_on(&over).country_count(), None);
+		assert_eq!(
+			backend_on(&CountFixture::countries(0)).country_count(),
+			None
+		);
+	}
+
+	/// One trade node, a province array, and an optional live member vector.
+	/// Province 1's tax differs from province 2's so a test can see which
+	/// list `aggregate_taxes` actually summed.
+	#[cfg(windows)]
+	struct TaxMap {
+		context: Vec<u64>,
+		nodes: Vec<u64>,
+		node: Vec<u64>,
+		definition: Vec<u64>,
+		members: Vec<i32>,
+		route: Vec<u64>,
+		provinces: Vec<u8>,
+	}
+
+	#[cfg(windows)]
+	enum LiveMembers {
+		Ids(&'static [i32]),
+		Empty,
+		/// Header fails `StdVector` validation, so `member_provinces` is `None`.
+		Corrupt,
+	}
+
+	#[cfg(windows)]
+	impl TaxMap {
+		fn build(live: LiveMembers) -> Self {
+			let mut context =
+				vec![
+					0_u64;
+					(dataplane::layout::DB_IN_CONTEXT + dataplane::layout::db::NODE_COUNT + 4)
+						.div_ceil(8)
+				];
+			let mut nodes = vec![0_u64; 1];
+			let mut node = vec![0_u64; (dataplane::layout::node::DEFINITION + 8).div_ceil(8)];
+			let mut definition = vec![0_u64; (dataplane::layout::def::ROUTES_END + 8).div_ceil(8)];
+			let members = match live {
+				LiveMembers::Ids(ids) => ids.to_vec(),
+				LiveMembers::Empty | LiveMembers::Corrupt => vec![1_i32],
+			};
+			let mut route = vec![0_u64; dataplane::layout::route::SIZE.div_ceil(8)];
+			let stride = dataplane::layout::province::CPROVINCE_SIZE;
+			let mut provinces = vec![0_u8; stride * 3];
+
+			let context_addr = context.as_mut_ptr() as usize;
+			let nodes_addr = nodes.as_mut_ptr() as usize;
+			let node_addr = node.as_mut_ptr() as usize;
+			let def_addr = definition.as_mut_ptr() as usize;
+			let members_addr = members.as_ptr() as usize;
+			let route_addr = route.as_mut_ptr() as usize;
+			let prov_addr = provinces.as_mut_ptr() as usize;
+
+			unsafe {
+				std::ptr::write_unaligned(
+					(context_addr + dataplane::layout::province::CPROVINCES) as *mut u64,
+					prov_addr as u64,
+				);
+				std::ptr::write_unaligned(
+					(context_addr + dataplane::layout::DB_IN_CONTEXT + dataplane::layout::db::NODES)
+						as *mut u64,
+					nodes_addr as u64,
+				);
+				std::ptr::write_unaligned(
+					(context_addr
+						+ dataplane::layout::DB_IN_CONTEXT
+						+ dataplane::layout::db::NODE_COUNT) as *mut i32,
+					1,
+				);
+				std::ptr::write_unaligned(nodes_addr as *mut u64, node_addr as u64);
+				std::ptr::write_unaligned(
+					(node_addr + dataplane::layout::node::DEFINITION) as *mut u64,
+					def_addr as u64,
+				);
+
+				let (begin, end, cap) = match live {
+					LiveMembers::Ids(ids) => {
+						let end = members_addr + ids.len() * 4;
+						(members_addr, end, end)
+					}
+					LiveMembers::Empty => (0, 0, 0),
+					LiveMembers::Corrupt => {
+						(members_addr, members_addr.wrapping_sub(4), members_addr)
+					}
+				};
+				let header = def_addr + dataplane::layout::def::MEMBERS;
+				std::ptr::write_unaligned(header as *mut u64, begin as u64);
+				std::ptr::write_unaligned((header + 8) as *mut u64, end as u64);
+				std::ptr::write_unaligned((header + 16) as *mut u64, cap as u64);
+
+				std::ptr::write_unaligned(
+					(def_addr + dataplane::layout::def::ROUTES) as *mut u64,
+					route_addr as u64,
+				);
+				std::ptr::write_unaligned(
+					(def_addr + dataplane::layout::def::ROUTES_END) as *mut u64,
+					(route_addr + dataplane::layout::route::SIZE) as u64,
+				);
+				let key = b"malacca";
+				std::ptr::copy_nonoverlapping(
+					key.as_ptr(),
+					(route_addr + 0x10) as *mut u8,
+					key.len(),
+				);
+				std::ptr::write_unaligned((route_addr + 0x20) as *mut u64, key.len() as u64);
+				std::ptr::write_unaligned((route_addr + 0x28) as *mut u64, 0xF);
+				std::ptr::write_unaligned(
+					(route_addr + dataplane::layout::route::TARGET) as *mut u64,
+					def_addr as u64,
+				);
+
+				// Province 1 is the live list; province 2 is the static table.
+				std::ptr::write_unaligned(
+					(prov_addr + stride + dataplane::layout::province::TAX) as *mut i32,
+					3_000,
+				);
+				std::ptr::write_unaligned(
+					(prov_addr + stride * 2 + dataplane::layout::province::TAX) as *mut i32,
+					9_000,
+				);
+			}
+
+			Self {
+				context,
+				nodes,
+				node,
+				definition,
+				members,
+				route,
+				provinces,
+			}
+		}
+
+		fn aggregate(&self, static_ids: Vec<u32>) -> LiveBackend {
+			// The buffers are only reached through copied addresses. Keep
+			// those addresses observable so the copies stay live.
+			std::hint::black_box((
+				self.context.as_ptr(),
+				self.nodes.as_ptr(),
+				self.node.as_ptr(),
+				self.definition.as_ptr(),
+				self.members.as_ptr(),
+				self.route.as_ptr(),
+				self.provinces.as_ptr(),
+			));
+			let mut backend = LiveBackend::with_members(
+				if static_ids.is_empty() {
+					Vec::new()
+				} else {
+					vec![("malacca".to_string(), static_ids)]
+				},
+				SinkBasis::Mean,
+			);
+			backend.context = self.context.as_ptr() as usize;
+			backend.db = backend.context + dataplane::layout::DB_IN_CONTEXT;
+			// `self` owns every buffer the reads walk; it stays alive for
+			// this call, which is the whole window `ReadProcessMemory` needs.
+			backend.aggregate_taxes(1);
+			backend
+		}
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn aggregate_taxes_prefers_the_live_member_vector() {
+		let map = TaxMap::build(LiveMembers::Ids(&[1]));
+		let backend = map.aggregate(vec![2]);
+		assert_eq!(backend.node_tax.get(&0).copied(), Some(3_000.0));
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn aggregate_taxes_falls_back_when_the_live_vector_is_empty_or_invalid() {
+		for live in [LiveMembers::Empty, LiveMembers::Corrupt] {
+			let map = TaxMap::build(live);
+			let backend = map.aggregate(vec![2]);
+			assert_eq!(backend.node_tax.get(&0).copied(), Some(9_000.0));
+		}
+		let map = TaxMap::build(LiveMembers::Empty);
+		let backend = map.aggregate(Vec::new());
+		assert!(backend.node_tax.is_empty());
 	}
 }
