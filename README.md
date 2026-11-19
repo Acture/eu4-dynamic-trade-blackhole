@@ -81,6 +81,28 @@ filled in). After importing a rebuilt package, remove the previous
 
 ## Configuration
 
+Five presets cover the common play styles — no hand-editing of
+`selections.toml`:
+
+```powershell
+uv run plugins/eu4-dynamic-trade-blackhole/tools/presets.py --playset default --preset standard
+```
+
+| Preset | Feel |
+| --- | --- |
+| `observer` | watch only: full monthly logs, the engine untouched |
+| `gentle` | slow convergence: a year of evidence, few flips, small fees |
+| `standard` | the tuned default the experiments validated |
+| `assertive` | fast convergence: four months of evidence, higher fees |
+| `sandbox` | everything off — the safest first run |
+
+The tool is idempotent (re-running replaces only this plugin's config
+section), preserves every other plugin's choices, refuses unknown
+playsets unless `--force`, and the result loads through
+`foch plugin plan` unchanged. Individual keys stay overridable by hand
+afterwards; the [reference table](#configuration) below documents them.
+
+
 Per playset, in `~/.config/foch/plugins/selections.toml`:
 
 | Key | Default | Meaning |
