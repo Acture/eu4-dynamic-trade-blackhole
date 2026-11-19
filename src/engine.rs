@@ -58,6 +58,8 @@ pub struct Engine<B: EngineBackend, F: Fn(i32, &str)> {
 	/// Ticks seen; each one is one monthly-cadence step of the hook.
 	ticks: u32,
 	force_closed: bool,
+	/// Last month's world entrepot, for crown-change gazette lines.
+	world_entrepot: Option<u32>,
 	log: F,
 }
 
@@ -70,6 +72,7 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 			evidence: None,
 			ticks: 0,
 			force_closed: false,
+			world_entrepot: None,
 			log,
 		}
 	}
@@ -255,6 +258,16 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 		// invest for maximum carriage return.
 		for line in policy::transit_intelligence(nodes, self.closed.as_ref().unwrap(), &params) {
 			(self.log)(logging::INFO, &line);
+		}
+		// The monthly gazette: entrepot tiers from the ranking, with
+		// crown-change lines when the world entrepot moves. Pure
+		// information (design.md P0); the fee surcharge is not in it.
+		let ranking = policy::entrepot_ranking(nodes);
+		for line in policy::gazette(&ranking, self.world_entrepot) {
+			(self.log)(logging::INFO, &line);
+		}
+		if let Some((node, _)) = ranking.first() {
+			self.world_entrepot = Some(*node);
 		}
 		// Reopen diagnostics: every closed edge's net flow against the
 		// threshold band, so a stuck reopen is visible month by month.
@@ -716,6 +729,71 @@ mod tests {
 		);
 		engine.tick();
 		assert!(state.borrow().payments.is_empty());
+	}
+
+	#[test]
+	fn the_gazette_crowns_and_tracks_the_world_entrepot() {
+		let state = inner();
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes = vec![
+				NodeSnapshot {
+					id: 0,
+					tax: 1000.0,
+					retention: 0.1,
+					production: 8000.0,
+					trade_power: 100.0,
+					current_value: 9000.0,
+					outgoing: vec![1],
+					steering: vec![0.0],
+				},
+				NodeSnapshot {
+					id: 1,
+					tax: 1000.0,
+					retention: 0.1,
+					production: 0.0,
+					trade_power: 5000.0,
+					current_value: 20000.0,
+					outgoing: vec![],
+					steering: vec![],
+				},
+			];
+		}
+		let logs = RefCell::new(Vec::new());
+		let mut engine = make(
+			Config {
+				mode: Mode::Policy,
+				..Config::default()
+			},
+			&state,
+			&logs,
+		);
+		engine.tick();
+		let first = logs.borrow().join(
+			"
+",
+		);
+		assert!(
+			first.contains("world entrepot crowned: 1"),
+			"gazette: {first}"
+		);
+		// Dethrone: node 0 becomes both the bigger pool and the bigger
+		// power next month, so its score overtakes node 1's.
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes[0].current_value = 50000.0;
+			inner.nodes[0].trade_power = 9000.0;
+			inner.nodes[1].current_value = 20000.0;
+		}
+		engine.tick();
+		let second = logs.borrow().join(
+			"
+",
+		);
+		assert!(
+			second.contains("dethrones 1"),
+			"crown change logged: {second}"
+		);
 	}
 
 	#[test]
