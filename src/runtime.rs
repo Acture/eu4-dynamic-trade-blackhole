@@ -285,7 +285,7 @@ impl LiveBackend {
 			crate::logging::write(
 				crate::logging::WARN,
 				&format!(
-					"tax covers only {covered}/{count} nodes: the members table is vanilla-derived 					 and this playset replaces the trade map; regenerate it with 					 tools/gen_members.py --game <EU4> <mod roots> --out node_members.txt"
+					"tax covers only {covered}/{count} nodes: the members table does not cover this trade map; regenerate it with tools/gen_members.py --game <EU4> --playset <dlc_load.json> --out node_members.txt"
 				),
 			);
 		}

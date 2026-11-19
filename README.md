@@ -148,13 +148,13 @@ automated end-to-end harness is `tests/e2e-mod/` (run via
 ## Modded trade maps
 
 The shipped tax table is vanilla-derived. On total conversions
-(Anbennar, MEIOU, ...) regenerate it for the active playset — later
-roots override earlier ones wholesale, mirroring the game's own load
-order:
+(Anbennar, MEIOU, ...) regenerate it for the active playset. The tool
+follows the game's load: `dlc_load.json` order, `replace_path` from the
+`.mod` file that playset names, and whole-file replacement.
 
 ```powershell
 uv run plugins/eu4-dynamic-trade-blackhole/tools/gen_members.py `
-  --game <EU4 install> <mod root 1> <mod root 2> `
+  --game <EU4 install> --playset <dlc_load.json> `
   --out plugins/eu4-dynamic-trade-blackhole/tools/node_members.txt
 ```
 
