@@ -11,6 +11,12 @@ use serde_json::json;
 /// The receipt prefix the judge recognizes.
 pub const PREFIX: &str = "FOCH_RECEIPT/1 ";
 
+/// The self-declared case name every receipt carries: these decisions
+/// are the plugin's own monthly policy, not answers to a scripted
+/// command, so the case is a constant and the request number is the
+/// tick that decided.
+pub const CASE: &str = "policy_month";
+
 /// One receipt line, ready for the host log.
 pub fn line(payload: serde_json::Value) -> String {
 	format!("{PREFIX}{payload}")
@@ -20,6 +26,8 @@ pub fn line(payload: serde_json::Value) -> String {
 pub fn flip(action: &str, node: u32, target: u32, tick: u32, net_flow: i64, pool: i64) -> String {
 	line(json!({
 		"type": "edge_flip",
+		"case": CASE,
+		"request": tick.to_string(),
 		"action": action,
 		"node": node.to_string(),
 		"target": target.to_string(),
@@ -35,6 +43,8 @@ pub fn flip(action: &str, node: u32, target: u32, tick: u32, net_flow: i64, pool
 pub fn fees(kind: &str, node: u32, tick: u32, volume: i64, pool: i64, recipients: usize) -> String {
 	line(json!({
 		"type": "role_fees",
+		"case": CASE,
+		"request": tick.to_string(),
 		"kind": kind,
 		"node": node.to_string(),
 		"tick": tick.to_string(),
@@ -48,6 +58,8 @@ pub fn fees(kind: &str, node: u32, tick: u32, volume: i64, pool: i64, recipients
 pub fn gazette(tick: u32, world: u32, previous: Option<u32>, world_score: i64) -> String {
 	line(json!({
 		"type": "gazette",
+		"case": CASE,
+		"request": tick.to_string(),
 		"tick": tick.to_string(),
 		"world_entrepot": world.to_string(),
 		"previous_entrepot": previous.map(|p| p.to_string()).unwrap_or_default(),
@@ -71,6 +83,7 @@ mod tests {
 			let map = value.as_object().unwrap();
 			assert!(map.values().all(serde_json::Value::is_string));
 			assert!(map.contains_key("type"));
+			assert_eq!(map["case"], CASE);
 			for key in ["plugin_id", "run_id", "timestamp_ms", "pid"] {
 				assert!(!map.contains_key(key), "envelope key {key} leaked");
 			}

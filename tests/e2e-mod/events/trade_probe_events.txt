@@ -21,5 +21,6 @@ country_event = {
 #     advance_days=200,
 #     expect_receipt = {
 #         plugin = Acture/eu4-dynamic-trade-blackhole
+#         case = policy_month
 #         type = edge_flip
 #     })

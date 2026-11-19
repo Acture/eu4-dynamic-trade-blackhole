@@ -60,6 +60,9 @@ pub struct Engine<B: EngineBackend, F: Fn(i32, &str)> {
 	force_closed: bool,
 	/// Last month's world entrepot, for crown-change gazette lines.
 	world_entrepot: Option<u32>,
+	/// Rolling entrepot scores for the 12-month moving average: the
+	/// latest twelve (tick, score) samples, oldest evicted first.
+	score_window: std::collections::VecDeque<(u32, f64)>,
 	log: F,
 }
 
@@ -73,6 +76,7 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 			ticks: 0,
 			force_closed: false,
 			world_entrepot: None,
+			score_window: Default::default(),
 			log,
 		}
 	}
@@ -278,13 +282,28 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 			(self.log)(logging::INFO, &line);
 		}
 		if let Some((node, score)) = ranking.first() {
+			// 12-month moving average of the leader's score: single-month
+			// spikes cannot move the crown on their own (design.md P0).
+			self.score_window.push_back((self.ticks, *score));
+			while self.score_window.len() > 12 {
+				self.score_window.pop_front();
+			}
+			let average = self.score_window.iter().map(|(_, s)| s).sum::<f64>()
+				/ self.score_window.len() as f64;
+			(self.log)(
+				logging::INFO,
+				&format!(
+					"gazette: world entrepot {node} 12-month average {average:.0} over {} months",
+					self.score_window.len()
+				),
+			);
 			(self.log)(
 				logging::INFO,
 				&crate::receipt::gazette(
 					self.ticks,
 					*node,
 					self.world_entrepot,
-					score.round() as i64,
+					average.round() as i64,
 				),
 			);
 			self.world_entrepot = Some(*node);
