@@ -250,6 +250,17 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 					logging::INFO,
 					&format!("tick {}: {}", self.ticks, flip.describe(nodes)),
 				);
+				(self.log)(
+					logging::INFO,
+					&crate::receipt::flip(
+						if want_closed { "close" } else { "reopen" },
+						flip.node,
+						nodes[flip.node as usize].outgoing[flip.edge],
+						self.ticks,
+						flip.net_flow.round() as i64,
+						flip.pool.round() as i64,
+					),
+				);
 			}
 		}
 		// Transit intelligence: which corridors carry the most flow and
@@ -266,7 +277,16 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 		for line in policy::gazette(&ranking, self.world_entrepot) {
 			(self.log)(logging::INFO, &line);
 		}
-		if let Some((node, _)) = ranking.first() {
+		if let Some((node, score)) = ranking.first() {
+			(self.log)(
+				logging::INFO,
+				&crate::receipt::gazette(
+					self.ticks,
+					*node,
+					self.world_entrepot,
+					score.round() as i64,
+				),
+			);
 			self.world_entrepot = Some(*node);
 		}
 		// Reopen diagnostics: every closed edge's net flow against the
@@ -329,6 +349,17 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 						pool.volume,
 						pool.pool,
 						paid.join(", ")
+					),
+				);
+				(self.log)(
+					logging::INFO,
+					&crate::receipt::fees(
+						pool.kind.label(),
+						pool.node,
+						self.ticks,
+						pool.volume.round() as i64,
+						pool.pool.round() as i64,
+						paid.len(),
 					),
 				);
 			}
@@ -793,6 +824,68 @@ mod tests {
 		assert!(
 			second.contains("dethrones 1"),
 			"crown change logged: {second}"
+		);
+	}
+
+	#[test]
+	fn decisions_emit_structured_receipts() {
+		let state = inner();
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes = vec![
+				NodeSnapshot {
+					id: 0,
+					tax: 5000.0,
+					retention: 0.98,
+					production: 8000.0,
+					trade_power: 100.0,
+					current_value: 8000.0,
+					outgoing: vec![1],
+					steering: vec![0.0],
+				},
+				NodeSnapshot {
+					id: 1,
+					tax: 500.0,
+					retention: 0.1,
+					production: 0.0,
+					trade_power: 100.0,
+					current_value: 0.0,
+					outgoing: vec![],
+					steering: vec![],
+				},
+			];
+			inner.participants = vec![(0, vec![(7, 100.0)])];
+		}
+		let logs = RefCell::new(Vec::new());
+		let mut engine = make(
+			Config {
+				mode: Mode::Policy,
+				evidence_months: 1,
+				..Config::default()
+			},
+			&state,
+			&logs,
+		);
+		engine.tick();
+		let messages = logs.borrow().join(
+			"
+",
+		);
+		// The flip receipt carries the decision as judge-parseable JSON.
+		assert!(messages.contains("FOCH_RECEIPT/1"), "receipts: {messages}");
+		assert!(
+			messages.contains(r#""type":"edge_flip""#),
+			"flip receipt: {messages}"
+		);
+		assert!(
+			messages.contains(r#""type":"gazette""#),
+			"gazette receipt: {messages}"
+		);
+		// Participants exist, so a fee receipt for the source bounty
+		// (the sink-hub ranking leader) is present too.
+		assert!(
+			messages.contains(r#""type":"role_fees""#),
+			"fee receipt: {messages}"
 		);
 	}
 

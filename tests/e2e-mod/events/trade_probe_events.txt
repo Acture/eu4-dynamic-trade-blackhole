@@ -12,3 +12,14 @@ country_event = {
 	immediate = { }
 	option = { name = OK }
 }
+
+# Receipt smoke: the plugin's decisions must reach the judge as
+# FOCH_RECEIPT/1 lines. The probes assert one of each decision type
+# lands with stable field names and value ranges (closing edges are
+# guaranteed by month 6 in any policy session from the 1444 start).
+#test(time=1444.11.11, tag=SWE, name="receipts_reach_the_judge",
+#     advance_days=200,
+#     expect_receipt = {
+#         plugin = Acture/eu4-dynamic-trade-blackhole
+#         type = edge_flip
+#     })
