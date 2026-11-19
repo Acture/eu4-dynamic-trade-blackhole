@@ -145,6 +145,24 @@ acceptance runs live in [`docs/internals.md`](docs/internals.md). The
 automated end-to-end harness is `tests/e2e-mod/` (run via
 `foch test --with-plugins`, each case its own real 800-day session).
 
+## Modded trade maps
+
+The shipped tax table is vanilla-derived. On total conversions
+(Anbennar, MEIOU, ...) regenerate it for the active playset — later
+roots override earlier ones wholesale, mirroring the game's own load
+order:
+
+```powershell
+uv run plugins/eu4-dynamic-trade-blackhole/tools/gen_members.py `
+  --game <EU4 install> <mod root 1> <mod root 2> `
+  --out plugins/eu4-dynamic-trade-blackhole/tools/node_members.txt
+```
+
+No node names or counts are assumed; the ranking, gazette, and fees
+work on any node set out of the box. When tax coverage collapses under
+a modded map, the log names this fix once instead of failing silently,
+and everything except the tax-gradient gate keeps running.
+
 ## Known limits
 
 - Pinned to Steam 1.37.5 x64; other builds are refused.

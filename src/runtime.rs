@@ -140,6 +140,8 @@ pub struct LiveBackend {
 	entry_logged: bool,
 	/// Whether the one-shot country probe already ran.
 	countries_probed: bool,
+	/// Whether the modded-trade-map warning already fired.
+	members_warned: bool,
 	/// Offline node-members table: internal key -> member province ids,
 	/// shipped in the plugin package (generated from 00_tradenodes.txt).
 	member_ids: HashMap<String, Vec<u32>>,
@@ -171,6 +173,7 @@ impl LiveBackend {
 			observes: 0,
 			entry_logged: false,
 			countries_probed: false,
+			members_warned: false,
 			member_ids: members.into_iter().collect(),
 			node_tax: HashMap::new(),
 			sink_basis,
@@ -272,6 +275,20 @@ impl LiveBackend {
 			crate::logging::INFO,
 			&format!("tax aggregated for {}/{} nodes", self.node_tax.len(), count),
 		);
+		// A modded trade map replaces the nodes the offline members
+		// table was built from: tax coverage collapses while the rest of
+		// the policy (flow, fees, gazette) keeps working. Name the fix
+		// once per session instead of failing silently.
+		let covered = self.node_tax.len();
+		if covered * 4 < count * 3 && !self.members_warned {
+			self.members_warned = true;
+			crate::logging::write(
+				crate::logging::WARN,
+				&format!(
+					"tax covers only {covered}/{count} nodes: the members table is vanilla-derived 					 and this playset replaces the trade map; regenerate it with 					 tools/gen_members.py --game <EU4> <mod roots> --out node_members.txt"
+				),
+			);
+		}
 	}
 
 	/// Read an MSVC SSO string holding an internal key (`a-z0-9_`).
