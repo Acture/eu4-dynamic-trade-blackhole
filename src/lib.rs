@@ -15,14 +15,13 @@ mod config;
 mod engine;
 mod hook;
 mod logging;
-mod offsets;
 mod policy;
 mod receipt;
 mod runtime;
 mod state;
 
 use foch_plugin_sdk::{
-	ABI_MAJOR, ABI_MINOR, FochHostApi, FochPluginApi, FochStr, result, state as state_code,
+	ABI_MAJOR, ABI_MINOR, FochHostApi, FochPluginApi, result, state as state_code,
 };
 use state::Reason;
 
@@ -93,67 +92,34 @@ unsafe extern "C" fn init(host: *const FochHostApi) -> i32 {
 	);
 
 	// Identity first: the digest is the sole proof this build was reversed.
-	let Some(sigs) = offsets::Sigs::for_build(exe_sha256) else {
+	if exe_sha256 != foch_runtime::dataplane::pinned_exe_sha256() {
 		return refuse(
 			host,
 			Reason::ExeMismatch,
 			"refused: eu4.exe is not the reversed build",
 		);
-	};
-	if sigs.is_pending() {
-		return refuse(
-			host,
-			Reason::OffsetsPending,
-			"refused: RE signatures still pending",
-		);
 	}
 
-	let resolve = |signature: &'static str, label: &str| -> Result<usize, ()> {
-		let mut address = std::ptr::null_mut();
-		let code = unsafe { (host.find_pattern)(host, FochStr::from_str(signature), &mut address) };
-		if code == result::OK && !address.is_null() {
+	// SAFETY: `host` is the process-lifetime table. The resolver reads the
+	// digest and calls `find_pattern` synchronously; it does not retain the
+	// pattern or the image pointer.
+	let tick = match unsafe { foch_runtime::dataplane::resolve_monthly_tick(host) } {
+		Ok(address) => {
 			logging::write(
 				foch_plugin_sdk::log::DEBUG,
-				&format!("{label} at 0x{:x}", address as usize),
+				&format!("trade recalculation at 0x{:x}", address as usize),
 			);
-			return Ok(address as usize);
+			address as usize
 		}
-		let outcome = if code == result::E_AMBIGUOUS {
-			"ambiguous"
-		} else {
-			"not found"
-		};
-		logging::write(
-			foch_plugin_sdk::log::WARN,
-			&format!("{label} pattern {outcome}"),
-		);
-		Err(())
+		Err(detail) => {
+			let reason = if detail.contains("did not match") {
+				Reason::BadLayout
+			} else {
+				Reason::PatternFailed
+			};
+			return refuse(host, reason, &format!("refused: {detail}"));
+		}
 	};
-	let Ok(tick) = resolve(sigs.tick, "trade recalculation") else {
-		return refuse(
-			host,
-			Reason::PatternFailed,
-			"refused: a pinned signature failed to resolve",
-		);
-	};
-	// Cross-check the resolved address against the spike's recorded RVA:
-	// a matching pattern at a different address means a rebuilt exe that
-	// happens to share these bytes, which the layout tables do not cover.
-	if tick - host.exe_base as usize != foch_runtime::dataplane::layout::TICK_RVA {
-		logging::write(
-			foch_plugin_sdk::log::WARN,
-			&format!(
-				"tick resolved at +0x{:x}, spike recorded +0x{:x}; refusing",
-				tick - host.exe_base as usize,
-				foch_runtime::dataplane::layout::TICK_RVA
-			),
-		);
-		return refuse(
-			host,
-			Reason::BadLayout,
-			"refused: the economy update moved from its recorded offset",
-		);
-	}
 
 	// The hook must be created and first-enabled inside this init call:
 	// the host refuses a first prologue jump after the entry window.
