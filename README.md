@@ -1,174 +1,306 @@
 # EU4 Dynamic Trade Blackhole
 
-A DLL plugin (built on the [Foch](https://github.com/Acture/foch) native
-host) that makes EU4's trade topology **dynamic**: instead of value
-flowing forever toward the three hardcoded end nodes, routes close and
-reopen during play according to where wealth actually is — so black
-holes emerge where purchasing power lives, and players can create them
-by developing the right provinces.
+A native DLL plugin (built on the [Foch](https://github.com/Acture/foch)
+runtime host) that makes EU4's trade topology **dynamic**: instead of trade
+value flowing forever toward the three hardcoded European end nodes, outgoing
+routes close and reopen during play according to where wealth actually
+converges — so black holes emerge where purchasing power lives, and players
+can create or break them by developing provinces.
 
-It never touches `common/tradenodes`, so it does not conflict with any
-trade mod: the engine only ever sees its own vanilla routes, pruned.
+It never edits `common/tradenodes`, so it does not conflict with script-level
+trade mods: the engine only ever sees its own loaded routes, reversibly
+pruned in memory.
 
 ## What changes in gameplay
 
-**Trade converges on wealth, not on Western Europe.** Every month the
-plugin runs a propagation model over the full vanilla trade graph:
-producers inject their local trade value, hubs relay it, and rich nodes
-absorb it. Edges that consistently carry nothing close; the wealth
-gradient (value should not flow from a richer node to a poorer one)
-gates every closure. Nodes whose whole outflow dies become emergent
-black holes — at the 1444 start, Malacca, Coromandel and Gujarat earn
-that on their own.
+### 1. Dynamic route closures and reopens
 
-**Farming creates black holes.** Development moves the levers:
+**Trade converges on wealth, not on Western Europe.** Every month the plugin
+runs a bidirectional propagation model over the full initial trade graph:
+producers inject local trade value, hubs relay it, and high-retention nodes
+absorb it.
 
-- Develop **tax**, and a node outbids its downstream: Japan's trade
-  stays in Japan.
-- Develop **production**, and a node's injection grows until its
-  outflow dies at the valve.
-- Let a closed route's flow recover (develop its source), and the route
-  **reopens** — closures are decisions, not deletions.
+- **Closing dead or backward routes:** Edges whose net forward flow stays
+  below the close threshold (`flow_epsilon_pct`, default `5%` of the source
+  node's reference pool) for `evidence_months` consecutive months (default
+  `6`) close, gated by the per-edge **wealth gradient** (the source node's
+  sink signal must be at least as high as the target's, so value stops
+  draining from a richer node into a poorer one). Nodes whose entire outflow
+  closes become emergent black holes — from a 1444 vanilla start, Malacca,
+  Coromandel, and Gujarat earn that on their own.
+- **Province development moves the levers:**
+  - Develop **tax** (and **manpower**, which joins the sink signal at half
+    weight as potential consumption) so a node outbids its downstream
+    neighbor: Japan's trade stays in Nippon instead of leaking to Hangzhou.
+  - Develop **production** to grow a node's local trade-value injection and
+    shift its retention and outflow balance.
+  - Revive a closed route's forward flow past the hysteresis reopen band
+    (`reopen_pct`, default `15%` of the source node's pool) for
+    `evidence_months` consecutive months, and the route **reopens** —
+    closures are reversible decisions, not permanent deletions.
 
-**Every trade role earns an income.** Vanilla only pays collectors;
-this plugin adds two channels so a middleman monopoly profits without
-owning either end:
+### 2. Three distinct role incomes
 
-| Role | Income |
-| --- | --- |
-| tax — sink | vanilla collection, amplified: a black hole keeps everything that arrives |
-| trade power — transit | a **transit fee**: a cut of the volume the node forwards for others |
-| production — source | a **source bounty**: a cut of the local production that leaves the node |
+Vanilla EU4 only pays collectors. This plugin splits each node's monthly
+outflow by origin into two non-overlapping fee pools so transit hubs and
+upstream producers profit from their roles without double-counting a single
+ducat:
 
-The two fees split a node's outflow by origin, so no ducat is paid
-twice, and both are distributed among the countries holding trade power
-in the node — by share. Pure relays earn the transit fee in full;
-producers earn the bounty even though their value flows away; sinks
-earn neither (their channel is the amplified collection).
+| Role | Lever | Income channel |
+| --- | --- | --- |
+| **Sink** (collector) | Tax & manpower | **Amplified vanilla collection**: closing outgoing routes keeps arriving value inside the node |
+| **Transit** (middleman) | Trade power & steering | **Transit fee**: a cut (`transit_fee_pct`, default `20%`) of the volume the node forwards on behalf of upstream partners (`outflow × inflow / (inflow + production)`) |
+| **Source** (producer) | Production | **Source bounty**: a cut (`source_fee_pct`, default `20%`) of the node's own local production exported downstream (`outflow × production / (inflow + production)`) |
 
-Verified end to end on the real game (800-day sessions): a tax-farmed
-Nippon closes its only edge at month 8; a scheduled late farm flips a
-closed edge's net flow from −1.9% to +24% and reopens it at month 22;
-the same farm run with and without the plugin leaves the farming nation
-a full treasury bracket richer, with the gap attributed to the black
-hole holding 48.5 vs 34.9 trade value in its node.
+Both fee pools are distributed each month among the countries holding trade
+power in that node, proportional to their power share (shares below `0.001`
+ducats are skipped), and credited directly to each country's treasury. Pure
+relays earn the transit fee in full; upstream producers earn the source
+bounty even when their goods flow away; pure sinks forward nothing and earn
+neither fee because their reward is the retained collection pool.
+
+### 3. World Trade Hub Gazette, 12-month moving average, and corridor intelligence
+
+Every policy month the plugin ranks all trade nodes by their entrepôt score —
+`(current_value - production).max(0) × trade_power.max(1)` — measuring which
+hubs both attract external trade value and command the power to move it
+(stripping local production so pure producers do not masquerade as transit
+entrepôts):
+
+- **World Trade Hub Gazette:** Logs the monthly tier standings — the **World
+  Entrepôt** (rank 1), **Great Entrepôts** (top 3), and **Regional
+  Entrepôts** (top 8) — and announces whenever the World Entrepôt crown
+  changes hands (`world entrepot <node> dethrones <prev>`).
+- **12-month moving average:** Tracks a rolling 12-month window of the
+  leading node's entrepôt score and reports the smoothed average alongside
+  each month's gazette line and structured receipt, preventing single-month
+  spikes from distorting the long-term benchmark.
+- **Transit intelligence & reopen diagnostics:** Logs the top 10 high-volume
+  transit corridors (flagging `← under-steered` whenever total steering
+  effort is below 10% of transit volume) and emits per-edge `DEBUG` progress
+  lines showing how close each closed route's net flow is to the
+  `reopen_pct` recovery band.
 
 ## Requirements
 
-- EU4 **1.37.5, Steam, Windows x64** — the only pinned build; anything
-  else is refused at load.
-- The [Foch](https://github.com/Acture/foch) CLI and its native plugin
-  host. This repository is a submodule of Foch
-  (`plugins/eu4-dynamic-trade-blackhole`); build from the Foch root.
+- **EU4 1.37.5, Steam, Windows x64** — verified by executable SHA-256 at
+  startup; any other binary is refused cleanly and leaves the plugin inert.
+- The [Foch](https://github.com/Acture/foch) CLI (`foch-cli`) and its native
+  runtime host (`foch-runtime-host`). This repository is mounted as a
+  submodule of Foch at `plugins/eu4-dynamic-trade-blackhole`.
 
 ## Build and install
 
-From the Foch checkout root:
+From the Foch workspace root:
 
 ```powershell
 git submodule update --init
-cargo build -p foch-plugin-trade-blackhole -p foch-eu4-host -p foch-cli --release --locked
+cargo build -p foch-plugin-trade-blackhole -p foch-runtime-host -p foch-cli --release --locked
 uv run python -I plugins/eu4-dynamic-trade-blackhole/tools/assemble_pkg.py
 foch plugin import ./target/plugin-pkg
 foch plugin enable Acture/eu4-dynamic-trade-blackhole --playset default
 foch plugin launch --playset default
 ```
 
-`tools/assemble_pkg.py` packages the release DLL with the offline
-node-membership table and the `foch-plugin.toml` manifest (digests
-filled in). After importing a rebuilt package, remove the previous
-`0.1.0+<hash>` store directory so `plugin enable` stays unambiguous.
+`tools/assemble_pkg.py` takes no command-line arguments: it automatically
+locates the workspace `target/` directory, copies
+`target/release/foch_plugin_trade_blackhole.dll` (renamed to
+`trade_blackhole.dll`) and `plugins/eu4-dynamic-trade-blackhole/tools/node_members.txt`
+into `target/plugin-pkg/`, and writes `foch-plugin.toml` with the computed
+`[[files]]` SHA-256 digests. After re-importing a rebuilt package, remove any
+older `0.0.1+<hash>` store directory if `foch plugin enable` reports multiple
+installed digests for the same version.
 
-## Configuration
+## Configuration and presets
 
-Five presets cover the common play styles — no hand-editing of
-`selections.toml`:
+### Player presets (`tools/presets.py`)
+
+Five built-in presets write the plugin's section in `selections.toml`
+(`.foch/selections.toml` if present in the working directory, otherwise
+`~/.config/foch/plugins/selections.toml`) without manual TOML editing:
 
 ```powershell
 uv run plugins/eu4-dynamic-trade-blackhole/tools/presets.py --playset default --preset standard
+# Pass --force to create the playset entry if it does not exist yet:
+uv run plugins/eu4-dynamic-trade-blackhole/tools/presets.py --playset custom --preset gentle --force
 ```
 
-| Preset | Feel |
-| --- | --- |
-| `observer` | watch only: full monthly logs, the engine untouched |
-| `gentle` | slow convergence: a year of evidence, few flips, small fees |
-| `standard` | the tuned default the experiments validated |
-| `assertive` | fast convergence: four months of evidence, higher fees |
-| `sandbox` | everything off — the safest first run |
-
-The tool is idempotent (re-running replaces only this plugin's config
-section), preserves every other plugin's choices, refuses unknown
-playsets unless `--force`, and the result loads through
-`foch plugin plan` unchanged. Individual keys stay overridable by hand
-afterwards; the [reference table](#configuration) below documents them.
-
-
-Per playset, in `~/.config/foch/plugins/selections.toml`:
-
-| Key | Default | Meaning |
+| Preset | Mode | Summary |
 | --- | --- | --- |
-| `mode` | `observe` | `observe` logs without mutating; `force_toggle` proves the mutation primitive on one node; `policy` runs the real planner |
-| `transit_fee` | `true` | pay the two role-income fees |
-| `transit_fee_pct` | `20` | the transit fee pool, as a percent of forwarded volume |
-| `source_fee_pct` | `20` | the source bounty pool, as a percent of exported local production |
-| `evidence_months` | `6` | months of sustained flow evidence before any edge flips |
-| `flow_epsilon_pct` / `reopen_pct` | `5` / `15` | the close/reopen hysteresis bands, as a percent of the node's pool |
-| `max_flips_total` | `16` | edge flips the whole graph may apply per month |
+| `observer` | `observe` | Watch only: `enabled = true`, full monthly observer logs, game routes and treasuries untouched |
+| `gentle` | `policy` | Slow convergence: `evidence_months = 12`, `flow_epsilon_pct = 5`, `reopen_pct = 20`, `max_flips_total = 8`, `10%` transit & source fees |
+| `standard` | `policy` | Balanced default: `evidence_months = 6`, `flow_epsilon_pct = 5`, `reopen_pct = 15`, `max_flips_total = 16`, `20%` transit & source fees |
+| `assertive` | `policy` | Fast convergence: `evidence_months = 4`, `flow_epsilon_pct = 3`, `reopen_pct = 12`, `max_flips_total = 24`, `25%` transit & source fees, `observer_log = false` |
+| `sandbox` | `observe` | Master switch off (`enabled = false`, `observer_log = true`) — inert first-run sanity check |
 
-The plugin logs every decision (flips, fees, per-node monthly series)
-to the host event stream; `foch plugin status --run-dir <dir>` reads it.
+`tools/presets.py` is idempotent: re-running updates only
+`Acture/eu4-dynamic-trade-blackhole` under the target playset and preserves
+all other playsets and plugin configurations.
+
+### Configuration reference
+
+Individual keys can be overridden under
+`[playsets.<name>.plugins."Acture/eu4-dynamic-trade-blackhole".config]`:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `true` | Master switch; `false` leaves the plugin an inert observer after startup |
+| `mode` | `string` | `"observe"` | `"observe"` logs without mutating; `"force_toggle"` alternates closing/reopening `force_node` each month; `"policy"` runs the propagation planner |
+| `force_node` | `string` | `"Great Lakes"` | Engine display name of the node toggled in `force_toggle` mode (case-insensitive, supports spaces and non-ASCII such as `"Lübeck"`) |
+| `observer_log` | `bool` | `true` | Emit per-node monthly `DEBUG` snapshots (`tax`, `prod`, `power`, `value`, `retention`, `edges`) |
+| `sink_basis` | `string` | `"mean"` | How member provinces' `tax + 0.5 × manpower` aggregates into a node's sink signal: `"mean"` (per-province wealth intensity) or `"sum"` (raw regional mass) |
+| `relay_ref` | `int` | `3000` | Trade power (thousandths, `> 0`) at which a partner doubles its relay pull (`1 + steering/1000 + trade_power/relay_ref`); higher values flatten hub preference |
+| `flow_epsilon_pct` | `int` | `5` | Close threshold (`0..=50`), as a percentage of the source node's reference pool (`max(retained, production, 1)`) |
+| `reopen_pct` | `int` | `15` | Reopen hysteresis threshold (`flow_epsilon_pct..=100`), as a percentage of the source node's reference pool |
+| `evidence_months` | `int` | `6` | Consecutive months of sustained below-epsilon or above-reopen flow required before an edge flips |
+| `max_flips_total` | `int` | `16` | Maximum route flips (`> 0`) the entire graph may apply in a single month |
+| `transit_fee` | `bool` | `true` | Enable monthly distribution of transit-fee and source-bounty pools |
+| `transit_fee_pct` | `int` | `20` | Transit fee pool (`0..=100`), as a percentage of volume forwarded for upstream nodes |
+| `source_fee_pct` | `int` | `20` | Source bounty pool (`0..=100`), as a percentage of local production exported out of the node |
+
+Any unknown enum value or out-of-range threshold automatically downgrades the
+plugin to safe observe-only mode (`enabled = false`, `mode = "observe"`).
+Decisions and diagnostics stream to the host event log and can be inspected
+with `foch plugin status --run-dir <dir>`.
+
+## Overhaul and map-mod compatibility
+
+- **Unbounded from vanilla entity counts:** The shared `foch-runtime` data
+  plane does not restrict trade nodes to a narrow vanilla band (`20..=512`)
+  or cap countries at `1024`. It accepts **`1..=4096` trade nodes**
+  (`MAX_TRADE_NODES`), **`1..=32767` countries** (`i16::MAX`), and up to
+  `65,536` member provinces per node — supporting both compact regional
+  scenarios and large total-conversion mods (Anbennar, MEIOU and Taxes,
+  Voltaire's Nightmare, etc.) without recompilation.
+- **Two-tier member-province resolution (live vector with automatic
+  fallback):**
+  1. **Primary — shared data-plane live vector:** Every 6 months when
+     aggregating node tax and manpower, the runtime first attempts to read
+     each node's member-province list directly from live engine memory via
+     `NodeView::member_provinces` (`CTradeNodeDefinition + 0x50`,
+     `std::vector<i32>`). *Note: this offset is statically identified for
+     EU4 1.37.5 and is pending live in-game verification.*
+  2. **Fallback — packaged `node_members.txt`:** Whenever the live vector
+     read returns `None` or is empty for a node, the runtime automatically
+     falls back to the offline `node_members.txt` table and logs a per-source
+     summary (`member source: <N> live vector ..., <M> static node_members.txt`).
+     If fewer than 75% of nodes resolve a member list, the plugin logs a
+     one-time warning naming `tools/gen_members.py` while keeping flow
+     propagation, role fees, and the gazette running.
+- **Regenerating `node_members.txt` (`tools/gen_members.py`):**
+  The shipped `tools/node_members.txt` is generated from vanilla
+  `00_tradenodes.txt`. To regenerate the fallback table for a modded playset,
+  run `tools/gen_members.py`, which replicates EU4's virtual directory loader
+  for `common/tradenodes/*.txt` — layering vanilla first, applying
+  `dlc_load.json` `enabled_mods` in exact load order, honoring
+  `replace_path` directives from the `.mod` descriptors (or `descriptor.mod`
+  when a mod directory is passed directly), reading both directory mods and
+  `.zip` Workshop archives, and merging surviving files in case-sensitive
+  filename order:
+
+  ```powershell
+  # From a launcher dlc_load.json playset:
+  uv run plugins/eu4-dynamic-trade-blackhole/tools/gen_members.py `
+    --game "<EU4 install>" --playset "<path/to/dlc_load.json>" `
+    --out plugins/eu4-dynamic-trade-blackhole/tools/node_members.txt
+
+  # Or by passing .mod descriptor files / mod directories directly in load order:
+  uv run plugins/eu4-dynamic-trade-blackhole/tools/gen_members.py `
+    --game "<EU4 install>" path/to/overhaul.mod path/to/submod_dir `
+    --out plugins/eu4-dynamic-trade-blackhole/tools/node_members.txt
+  ```
+
+  Re-run `tools/assemble_pkg.py` and `foch plugin import ./target/plugin-pkg`
+  afterwards so the packaged plugin carries the updated fallback table.
+
+## Offline test verification and `FOCH_RECEIPT/1` receipts
+
+The end-to-end test mod under `plugins/eu4-dynamic-trade-blackhole/tests/e2e-mod`
+defines annotated `#test(...)` scenarios covering baseline convergence, tax
+and production farming, scheduled route reopening, treasury income A/B
+comparisons, and receipt delivery.
+
+You can discover and validate all test cases offline without launching
+`eu4.exe`:
+
+```powershell
+# List all discovered e2e test cases:
+foch test plugins/eu4-dynamic-trade-blackhole/tests/e2e-mod --collect-only
+
+# Validate test annotations, expect/expect_receipt blocks, and event scripts offline:
+foch test plugins/eu4-dynamic-trade-blackhole/tests/e2e-mod --no-run
+```
+
+During policy runs, the plugin emits structured **`FOCH_RECEIPT/1 <json>`**
+lines (`case = "policy_month"`, `request = "<tick>"`, all payload values
+serialized as strings) that `expect_receipt` blocks in `foch test` can assert
+against:
+
+| Receipt `type` | Trigger | Payload fields |
+| --- | --- | --- |
+| `edge_flip` | A route closes or reopens | `case`, `request`, `tick`, `action` (`"close"` \| `"reopen"`), `node`, `target`, `net_flow`, `pool` |
+| `role_fees` | A node distributes a non-empty fee pool | `case`, `request`, `tick`, `kind` (`"transit fee"` \| `"source bounty"`), `node`, `volume`, `pool`, `recipients` |
+| `gazette` | Monthly World Entrepôt update | `case`, `request`, `tick`, `world_entrepot`, `previous_entrepot` (`""` on first crown), `world_score` (12-month moving average) |
 
 ## How it works
 
 Monthly, on the game thread, inside the economy-update hook:
 
-1. **Inject** — each node's local trade value (goods × price, read from
-   the engine) enters its pool.
-2. **Propagate** — pools relay across the *full bidirectional vanilla
-   graph* (closed edges included, so reopens stay possible and the model
-   never reacts to its own closures). Relay weight: steering effort plus
-   the partner's trade power. Retention is the engine's own rate — no
-   invented parameters.
-3. **Judge** — every vanilla edge is judged by its tracked net flow
-   against the hysteresis bands, gated by the per-edge wealth gradient;
-   six months of sustained evidence and a monthly flip budget prevent
-   flapping.
-4. **Mutate** — closures and reopens rewrite the engine's route vectors
-   reversibly from captured vanilla originals; the engine always sees a
-   legal subgraph of its own DAG.
-5. **Pay** — fee pools are distributed to each node's trade-power
-   holders by share, written to the countries' treasuries through the
-   same path the game's own `ChangeTreasury` uses.
+1. **Inject** — each node's local trade value (`goods × price`, read from the
+   engine) enters its pool.
+2. **Propagate** — pools relax over 8 rounds across the *full bidirectional
+   initial graph* (closed edges included, so reopens stay possible and the
+   model never cascades on its own closures). Relay weight is
+   `1 + steering/1000 + partner_power/relay_ref`; retention is the engine's
+   own `value / (value + transferred)` rate.
+3. **Judge** — every edge is judged by its accumulated net forward flow
+   against `flow_epsilon_pct` and `reopen_pct`, gated on closure by the
+   per-edge wealth gradient (`source.tax >= target.tax`), `evidence_months`
+   of consecutive evidence, and the `max_flips_total` monthly flip budget.
+4. **Mutate** — closures and reopens rewrite the engine's live route vectors
+   reversibly from captured originals (open routes first, closed routes
+   parked at the tail, vector `end` shrunk to the open prefix).
+5. **Report & Pay** — emits the transit intelligence lines, the World Trade
+   Hub Gazette (with the 12-month moving average), closed-edge reopen
+   diagnostics, and `FOCH_RECEIPT/1` receipts, then distributes transit-fee
+   and source-bounty pools to each node's trade-power holders via the same
+   clamped treasury write and UI-refresh bit as `CCountry::ChangeTreasury`.
 
-Engine internals, the reverse-engineering record, and the historical
-acceptance runs live in [`docs/internals.md`](docs/internals.md). The
-automated end-to-end harness is `tests/e2e-mod/` (run via
-`foch test --with-plugins`, each case its own real 800-day session).
+Engine layout details, reverse-engineering records, and historical acceptance
+logs are documented in [`docs/internals.md`](docs/internals.md).
 
-## Modded trade maps
+## Verification status and known limits
 
-The shipped tax table is vanilla-derived. On total conversions
-(Anbennar, MEIOU, ...) regenerate it for the active playset. The tool
-follows the game's load: `dlc_load.json` order, `replace_path` from the
-`.mod` file that playset names, and whole-file replacement.
-
-```powershell
-uv run plugins/eu4-dynamic-trade-blackhole/tools/gen_members.py `
-  --game <EU4 install> --playset <dlc_load.json> `
-  --out plugins/eu4-dynamic-trade-blackhole/tools/node_members.txt
-```
-
-No node names or counts are assumed; the ranking, gazette, and fees
-work on any node set out of the box. When tax coverage collapses under
-a modded map, the log names this fix once instead of failing silently,
-and everything except the tax-gradient gate keeps running.
-
-## Known limits
-
-- Pinned to Steam 1.37.5 x64; other builds are refused.
-- Ironman/achievements are unavailable while any DLL plugin is loaded.
-- Node membership ships as an offline table generated from vanilla
-  `00_tradenodes.txt`; mods that redefine trade-node membership need it
-  regenerated.
-- The fee incomes are treasury writes visible in the top bar; they do
-  not yet appear as a line in the budget UI.
+- **Verified in live 800-day EU4 1.37.5 sessions:**
+  - Economy-update hook installation and monthly tick cadence.
+  - Reversible route-vector closures and reopens across baseline and
+    development-farming scenarios (a tax-farmed Nippon closes its single
+    outgoing route at month 8; a scheduled 1446 farm drives a closed
+    `hangzhou -> xi'an` route's net flow from `−1.9%` to `+24.1%` and reopens
+    it at month 22).
+  - Role-income payouts and top-bar treasury updates (the same Malacca farm
+    run with and without the policy leaves Malacca a full treasury bracket
+    higher `[400, 600)` vs. `[200, 400)`, holding `48.5` vs. `34.9` trade
+    value in the closed black hole over 26 months).
+- **Verified by unit tests and offline checks (`--collect-only` / `--no-run`), pending live in-game verification:**
+  - Dynamic member-province reading from `CTradeNodeDefinition + 0x50`
+    (`NodeView::member_provinces`) is statically identified from reverse
+    engineering and covered by unit tests, but has not yet been probed in a
+    live EU4 session. The runtime automatically falls back to
+    `node_members.txt` if the live vector is unavailable or empty.
+  - The newest `FOCH_RECEIPT/1` structured receipt stream (`edge_flip`,
+    `role_fees`, `gazette`) combined with the World Trade Hub Gazette and
+    12-month moving-average leader score is verified in unit tests and
+    offline `foch test --no-run` validation, and awaits a full live
+    `foch test --with-plugins` session run.
+- **Other limits:**
+  - Pinned strictly to **Steam EU4 1.37.5 (Windows x64)**; other builds are
+    refused at load.
+  - Ironman and achievements are unavailable while any native DLL plugin is
+    loaded.
+  - When relying on the static `node_members.txt` fallback, mods that alter
+    trade-node province memberships must regenerate `node_members.txt` with
+    `tools/gen_members.py`.
+  - Transit fees and source bounties are direct treasury writes visible in
+    the top-bar ducat counter; they do not appear as a separate line item in
+    the in-game budget ledger UI.
