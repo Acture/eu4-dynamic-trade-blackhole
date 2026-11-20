@@ -30,7 +30,7 @@ try:
 except ModuleNotFoundError:  # py<3.11
 	sys.exit("presets.py needs Python 3.11+ (tomllib)")
 
-ID = "Acture/eu4-dynamic-trade-blackhole"
+ID = "dev.foch.eu4-dynamic-trade-blackhole"
 
 PRESETS: dict[str, dict[str, object]] = {
 	"observer": {

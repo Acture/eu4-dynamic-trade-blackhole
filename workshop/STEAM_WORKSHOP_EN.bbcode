@@ -1,0 +1,193 @@
+[h1]Dynamic Trade Blackhole — Break the 1444 Trade Rails[/h1]
+
+[quote]
+[b]"Tired of the English Channel, Genoa, and Venice always sucking the entire world's wealth dry no matter how powerful Ming, Hindustan, or the New World becomes?"[/b]
+[/quote]
+
+For over a decade in [i]Europa Universalis IV[/i], global commerce has been bolted onto 1444 railroad tracks. Even if you forge a 3,000-development superpower in East Asia, India, Persia, Africa, or the Americas, the arrows painted on the map still force your hard-earned trade value downstream toward Western Europe.
+
+[b]Dynamic Trade Blackhole[/b] shatters the fixed 1444 trade map. Powered by the [b]Foch[/b] runtime host, this mod makes EU4's trade network [b]alive, responsive, and reversible[/b]:
+[list]
+[*][b]Wealth Follows Economic Gravity:[/b] Outgoing trade routes dynamically close when a node's domestic purchasing power outgrows its downstream neighbor—preventing richer regions from draining into poorer ones.
+[*][b]Emergent End-Nodes ("Trade Black Holes"):[/b] When all outgoing routes from a trade hub close, it becomes an [b]emergent end-node[/b] that retains 100% of its trade value. Even from a 1444 start, powerhouses like [b]Malacca, Coromandel, and Gujarat[/b] can naturally earn black-hole status—or you can develop [b]Nippon[/b] to seal off its leak to Hangzhou!
+[*][b]Reversible Trade Corridors:[/b] No closure is permanent. Push massive trade power and steering back across a dormant corridor, and the route [b]dynamically reopens[/b].
+[*][b]Collectors, Middlemen & Producers All Get Paid:[/b] Vanilla EU4 only rewards the final collector. Here, transit hubs earn monthly [b]Transit Fees[/b] and manufacturing heartlands earn [b]Source Bounties[/b] straight into their national treasuries.
+[/list]
+
+[hr][/hr]
+
+[h2]Visual Showcase[/h2]
+
+[quote]
+[b][TODO: Replace with live in-game before/after screenshots after live verification][/b]
+[list]
+[*][b]Screenshot / GIF 1 — Vanilla 1600 Trade Map vs. Dynamic Asian & Indian End-Nodes:[/b] Side-by-side comparison showing Malacca, Coromandel, Gujarat, or a player-developed Nippon sealing off all outgoing routes into an emergent Trade Black Hole (e.g., Malacca retaining [b]48.5[/b] trade value vs. [b]34.9[/b] in vanilla over 26 months and climbing from the [code][200, 400)[/code] treasury bracket into [code][400, 600)[/code]).
+[*][b]Screenshot / GIF 2 — The World Trade Hub Gazette & Dynamic Route Reopening:[/b] Live capture of the monthly [b]World Trade Hub Gazette[/b] announcing a new World Entrepôt dethronement alongside its 12-month moving-average score, plus a closed route ([code]Hangzhou -> Xi'an[/code]) surging from [code]-1.9%[/code] to [code]+24.1%[/code] net forward flow and reopening at month 22.
+[*][b]Screenshot / GIF 3 — Three Economic Playstyles & 5-Preset Comparison:[/b] Infographic comparing Collector (Sink), Middleman (Transit Fee), and Producer (Source Bounty) income streams across the [code]gentle[/code], [code]standard[/code], and [code]assertive[/code] presets.
+[/list]
+[/quote]
+
+[hr][/hr]
+
+[h2]Core Gameplay Features[/h2]
+
+[h3]1. Every Development Click Shapes Global Trade Routes[/h3]
+Instead of forcing you to conquer half a continent downstream just to stop your ducats from leaking away, [b]Dynamic Trade Blackhole[/b] turns province development and trade fleets into strategic geo-economic levers:
+[list]
+[*][b]Tax & Manpower Development (Build Domestic Purchasing Power):[/b] A node's internal absorption ("sink signal") grows with its provinces' [b]Tax[/b] and [b]Manpower[/b] (counted at half weight to represent population consumption). When your node's purchasing power equals or exceeds a downstream neighbor's and net outflow drops below the close threshold ([code]flow_epsilon_pct[/code], default [b]5%[/b]), that outgoing route closes!
+[*][b]Production Development (Fuel Local Trade Value):[/b] Developing production injects fresh local goods value into the node's pool, shifting both local retention and export volume.
+[*][b]Trade Power & Steering (Reopen Dormant Corridors):[/b] Closed routes are never deleted from the game. If downstream merchants and trade fleets drive net forward flow back above the reopen threshold ([code]reopen_pct[/code], default [b]15%[/b]) for consecutive months, the route [b]reopens[/b] automatically.
+[/list]
+
+[h3]2. Three Distinct Economic Roles — Stop Getting Robbed Upstream![/h3]
+In vanilla EU4, if you don't own the end-node, your production and steering mostly enrich someone else. This mod splits each node's monthly outflow by origin into two non-overlapping fee pools distributed proportionally by trade power share directly to national treasuries:
+
+[table]
+[tr]
+[th]Economic Role[/th]
+[th]Primary Player Lever[/th]
+[th]How You Profit[/th]
+[/tr]
+[tr]
+[td][b]1. The Sink (Collector)[/b][/td]
+[td]Tax & Manpower Development[/td]
+[td][b]Emergent End-Node Collection:[/b] Close outgoing routes so 100% of arriving and local trade value stays trapped inside your home node for collection.[/td]
+[/tr]
+[tr]
+[td][b]2. The Middleman (Transit Hub)[/b][/td]
+[td]Trade Power & Steering[/td]
+[td][b]Monthly Transit Fee (Default 20%):[/b] Earn a direct treasury cut of all trade volume your hub forwards on behalf of upstream nodes. Pure relay hubs finally get paid like real historical Silk Road and spice entrepôts![/td]
+[/tr]
+[tr]
+[td][b]3. The Producer (Source Heartland)[/b][/td]
+[td]Production & Manufactories[/td]
+[td][b]Monthly Source Bounty (Default 20%):[/b] Earn a direct treasury cut of your node's own local production when it is exported downstream—so manufacturing giants profit even when their goods travel abroad.[/td]
+[/tr]
+[/table]
+
+[h3]3. Smooth 12-Month Moving Average "Trade Gazette" & Anti-Flicker Stability[/h3]
+Worried about trade routes ping-ponging open and shut every single month? We engineered multi-layered stability controls so the global trade map evolves organically over years and eras:
+[list]
+[*][b]Hysteresis & Multi-Month Evidence Cooldowns:[/b] By default, a route only closes after net flow stays below [b]5%[/b] for [b]6 consecutive months[/b] ([code]evidence_months = 6[/code]), and only reopens after sustained flow climbs back above [b]15%[/b] for [b]6 consecutive months[/b]. Combined with a monthly global flip cap ([code]max_flips_total = 16[/code]), trade geography shifts deliberately and predictably.
+[*][b]The World Trade Hub Gazette:[/b] Every month, all nodes are ranked by their true [b]Entrepôt Score[/b] (external trade value attracted × trade power, stripping out raw local production so pure resource regions don't masquerade as trade hubs). The Gazette tracks the [b]World Entrepôt[/b] (#1 global hub), [b]Great Entrepôts[/b] (Top 3), and [b]Regional Entrepôts[/b] (Top 8), logging historic announcements whenever a rising power dethrones the reigning World Entrepôt!
+[*][b]12-Month Moving Average Benchmark:[/b] The Gazette tracks a rolling [b]12-month moving average[/b] of the world leader's entrepôt score alongside monthly corridor intelligence (including under-steered high-volume corridors and reopen progress diagnostics), smoothing out seasonal noise.
+[/list]
+
+[h3]4. Five Ready-to-Play Presets (Zero Manual Config Editing Required)[/h3]
+Switch your campaign's economic feel anytime using the built-in preset tool ([code]tools/presets.py[/code]):
+
+[table]
+[tr]
+[th]Preset Name[/th]
+[th]Gameplay Feel[/th]
+[th]Key Rules & Payouts[/th]
+[/tr]
+[tr]
+[td][b][code]standard[/code][/b] [i](Recommended)[/i][/td]
+[td][b]Balanced Default[/b] — Tuned across multi-year test campaigns for responsive yet grounded economic evolution.[/td]
+[td]6 months evidence | Close < 5% / Reopen > 15% | Max 16 flips/mo | [b]20%[/b] Transit Fee & [b]20%[/b] Source Bounty[/td]
+[/tr]
+[tr]
+[td][b][code]gentle[/code][/b][/td]
+[td][b]Grand Historical Pace[/b] — Trade routes only shift after sustained, generational economic transformations.[/td]
+[td]12 months (1 full year) evidence | Close < 5% / Reopen > 20% | Max 8 flips/mo | [b]10%[/b] Transit Fee & [b]10%[/b] Source Bounty[/td]
+[/tr]
+[tr]
+[td][b][code]assertive[/code][/b][/td]
+[td][b]Cutthroat Trade Warfare[/b] — Fast route flips and high rewards for aggressive development and fleet steering.[/td]
+[td]4 months evidence | Close < 3% / Reopen > 12% | Max 24 flips/mo | [b]25%[/b] Transit Fee & [b]25%[/b] Source Bounty[/td]
+[/tr]
+[tr]
+[td][b][code]observer[/code][/b][/td]
+[td][b]Pure Analytics Watch Mode[/b] — Keeps vanilla trade routes and treasuries 100% untouched while logging full monthly trade diagnostics.[/td]
+[td][code]mode = "observe"[/code] | No route changes | No fee payouts | Full monthly observer logs enabled[/td]
+[/tr]
+[tr]
+[td][b][code]sandbox[/code][/b][/td]
+[td][b]Safe First-Run Sanity Check[/b] — Master switch off so you can verify your Foch launch setup before enabling dynamic trade.[/td]
+[td][code]enabled = false[/code] | Completely inert after startup verification[/td]
+[/tr]
+[/table]
+
+Want fine-grained control? Advanced players can also customize individual parameters in [code]selections.toml[/code], including [code]sink_basis[/code] ([code]"mean"[/code] per-province wealth intensity so tall nations shine vs. [code]"sum"[/code] raw regional mass for sprawling empires), [code]relay_ref[/code], [code]flow_epsilon_pct[/code], [code]reopen_pct[/code], [code]evidence_months[/code], [code]max_flips_total[/code], [code]transit_fee_pct[/code], and [code]source_fee_pct[/code]. Any invalid manual edit safely auto-downgrades to observe-only mode instead of crashing!
+
+[hr][/hr]
+
+[h2]Built for Total Overhaul Mods (Anbennar, MEIOU & Taxes, Ante Bellum & More!)[/h2]
+
+Most trade mods overwrite [code]common/tradenodes/00_tradenodes.txt[/code], instantly breaking every map overhaul on the Steam Workshop. [b]Dynamic Trade Blackhole never edits a single trade-node script file:[/b]
+[list]
+[*][b]Zero Hardcoded Vanilla Nodes:[/b] Supports anywhere from [b]1 to 4,096 trade nodes[/b], up to [b]32,767 countries[/b], and up to [b]65,536 provinces per node[/b] out of the box.
+[*][b]Plug-and-Play with Major Overhauls:[/b] Designed from day one to work naturally with [b]Anbennar[/b], [b]MEIOU & Taxes[/b], [b]Ante Bellum[/b], [b]Extended Timeline[/b], [b]Voltaire's Nightmare[/b], and any custom fantasy or alternate-history map.
+[*][b]Dynamic Node Discovery + Playset [code]replace_path[/code] Support:[/b] The runtime automatically discovers trade nodes and province memberships dynamically, backed by an automatic fallback table ([code]node_members.txt[/code]). Using a heavy mod stack that reshapes trade regions? Run the included [code]tools/gen_members.py[/code] helper—it reads your exact EU4 launcher playset ([code]dlc_load.json[/code]), respects mod load order, reads [code].zip[/code] Workshop archives, and honors overhaul [code]replace_path[/code] directives automatically!
+[/list]
+
+[hr][/hr]
+
+[h2]Simple 3-Step Installation via Foch[/h2]
+
+[h3]Why Does This Mod Use the Foch Runtime Loader?[/h3]
+EU4's Clausewitz script engine has [b]no script command or trigger[/b] capable of adding, removing, or reversing trade-node arrows once a campaign starts. To make trade routes dynamically close and reopen during live gameplay without corrupting saves or conflicting with overhaul mods, this mod runs as a native plugin inside [b]Foch[/b] ([url=https://github.com/Acture/foch]GitHub: Acture/foch[/url]):
+[list]
+[*][b]100% Clean & Non-Invasive:[/b] Foch loads the plugin in an isolated runtime layer when launching the game. It [b]never patches, modifies, or overwrites your Steam [code]eu4.exe[/code] or any file in your EU4 installation folder[/b].
+[*][b]One-Command Toggle:[/b] Disable or uninstall the plugin at any time with a single command and your base game remains completely untouched.
+[*][b]Role of This Steam Workshop Item:[/b] Subscribe to this Workshop item to keep the companion mod in your playset and stay updated on release announcements, documentation, and presets, then activate the runtime plugin in 3 quick steps below.
+[/list]
+
+[h3]Step 1 — Install the Plugin (China Mirror Supported!)[/h3]
+With [b]Foch CLI[/b] installed, download and install the plugin package (players in Mainland China can pass [code]--mirror cn[/code] or [code]--mirror auto[/code] for high-speed mirror acceleration):
+[code]
+# Automatic mirror selection:
+foch plugin install Acture/eu4-dynamic-trade-blackhole --mirror auto
+
+# Or force Mainland China mirror acceleration:
+foch plugin install Acture/eu4-dynamic-trade-blackhole --mirror cn
+[/code]
+[i](Building from a local Foch workspace instead? Run [code]foch plugin import ./target/plugin-pkg[/code] after assembling the package.)[/i]
+
+[h3]Step 2 — Enable the Plugin & Choose Your Preset[/h3]
+Enable the plugin for your playset (e.g., [code]default[/code]) and optionally apply any of the 5 gameplay presets:
+[code]
+foch plugin enable dev.foch.eu4-dynamic-trade-blackhole --playset default
+
+# Optional — switch between standard, gentle, assertive, observer, or sandbox:
+uv run plugins/eu4-dynamic-trade-blackhole/tools/presets.py --playset default --preset standard
+[/code]
+
+[h3]Step 3 — Launch EU4 Through Foch[/h3]
+Start the game through Foch so the dynamic trade runtime attaches cleanly:
+[code]
+foch plugin launch --playset default
+[/code]
+
+[hr][/hr]
+
+[h2]Compatibility, Safety & Honest Status FAQ[/h2]
+
+[list]
+[*][b]Which EU4 version is supported?[/b]
+Strictly pinned to [b]EU4 v1.37.5 (Steam, Windows x64)[/b]. At startup, the plugin verifies the exact SHA-256 fingerprint of your [code]eu4.exe[/code]. If Paradox pushes a new update or you run a different executable build, the plugin [b]fails closed (refuses to load and stays completely inert)[/b]—meaning it will [b]never crash your game or corrupt your save files[/b] on an unsupported patch.
+
+[*][b]Is this Ironman or Achievement compatible?[/b]
+[b]No.[/b] Because Dynamic Trade Blackhole runs as a native runtime plugin launched via [code]foch plugin launch[/code] and alters core economic gameplay, Ironman mode and Steam Achievements are unavailable while any native plugin is loaded.
+
+[*][b]Does it work in Multiplayer?[/b]
+[b]Yes, with matching setups.[/b] Every player in the multiplayer lobby must launch EU4 through Foch using the [b]exact same plugin version and preset configuration[/b] so all clients evaluate identical monthly trade route flips and treasury fee payouts.
+
+[*][b]Where do I see my Transit Fees and Source Bounties in-game?[/b]
+Monthly Transit Fees and Source Bounties are deposited directly into each eligible nation's treasury on the monthly economy tick and update your [b]top-bar ducat counter immediately[/b]. Because EU4's vanilla budget ledger UI has fixed line-item categories, these payouts do not appear as a separate row inside the Economy tab's monthly balance breakdown, though every payout is logged in full detail in the Foch event log ([code]foch plugin status --run-dir <dir>[/code]).
+
+[*][b]What is the current testing and verification status?[/b]
+We believe in 100% transparency with players:
+[list]
+[*][b]Live-Verified in 800-Day EU4 1.37.5 Soak Tests:[/b] Monthly economy hook stability, reversible route closures and reopenings (e.g., tax-developed Nippon sealing its outgoing leak at month 8; developed [code]Hangzhou -> Xi'an[/code] recovering from [code]-1.9%[/code] to [code]+24.1%[/code] net flow and reopening at month 22), and monthly treasury role-fee payouts (Malacca retaining [b]48.5[/b] vs. [b]34.9[/b] trade value and advancing a full treasury bracket over 26 months) are verified in live game sessions.
+[*][b]In Progress Before v1.0 Release:[/b] The newest shared dataplane update (automatic runtime member-province discovery with [code]node_members.txt[/code] fallback), the 5-preset switcher, and the expanded [b]World Trade Hub Gazette[/b] (with 12-month moving-average scoring and structured receipts) have passed comprehensive unit tests and offline end-to-end validation ([code]foch test --no-run[/code]) and are currently undergoing final live in-game re-verification prior to tagging the v1.0 release.
+[/list]
+[/list]
+
+[hr][/hr]
+
+[quote]
+[b]Ready to rewrite the history of global trade?[/b]
+Hit [b]Subscribe[/b], favorite & rate up if you've waited ten years to make Beijing, Malacca, Constantinople, Samarkand, or Cuzco the true economic center of the world!
+[/quote]

@@ -1,0 +1,6 @@
+﻿l_simp_chinese:
+ foch_dtb_status_title:0 "动态调整贸易黑洞"
+ foch_dtb_status_desc:0 "查看本配套模组与 Foch 运行时插件的关系。采纳此决议不会改变任何商路、国库或原版文件。"
+ foch_dtb_info.1.t:0 "动态调整贸易黑洞"
+ foch_dtb_info.1.d:0 "《动态调整贸易黑洞》以 Foch 原生插件运行，而不是靠这段脚本生效。请先执行 foch plugin enable dev.foch.eu4-dynamic-trade-blackhole，再用 foch plugin launch 启动欧陆风云4。本事件不改变战役。加载原生插件期间无法使用铁人模式。"
+ foch_dtb_info.1.a:0 "知道了"

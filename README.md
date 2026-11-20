@@ -98,18 +98,28 @@ git submodule update --init
 cargo build -p foch-plugin-trade-blackhole -p foch-runtime-host -p foch-cli --release --locked
 uv run python -I plugins/eu4-dynamic-trade-blackhole/tools/assemble_pkg.py
 foch plugin import ./target/plugin-pkg
-foch plugin enable Acture/eu4-dynamic-trade-blackhole --playset default
+foch plugin enable dev.foch.eu4-dynamic-trade-blackhole --playset default
 foch plugin launch --playset default
 ```
 
-`tools/assemble_pkg.py` takes no command-line arguments: it automatically
-locates the workspace `target/` directory, copies
+`tools/assemble_pkg.py` locates the workspace `target/` directory, copies
 `target/release/foch_plugin_trade_blackhole.dll` (renamed to
 `trade_blackhole.dll`) and `plugins/eu4-dynamic-trade-blackhole/tools/node_members.txt`
-into `target/plugin-pkg/`, and writes `foch-plugin.toml` with the computed
-`[[files]]` SHA-256 digests. After re-importing a rebuilt package, remove any
-older `0.0.1+<hash>` store directory if `foch plugin enable` reports multiple
+into `target/plugin-pkg/` (or `--out <dir>`), and writes `foch-plugin.toml`
+with plugin id `dev.foch.eu4-dynamic-trade-blackhole` and the computed
+`[[files]]` SHA-256 digests. `foch plugin install` still takes the GitHub
+repository `Acture/eu4-dynamic-trade-blackhole`; enable and presets use the
+plugin id. After re-importing a rebuilt package, remove any older
+`0.0.1+<hash>` store directory if `foch plugin enable` reports multiple
 installed digests for the same version.
+
+The Steam Workshop companion lives in `workshop/`: a descriptor, one optional
+human-only decision, and one informational event. It does not edit trade
+nodes or any other vanilla file. Subscribe to it for the playset entry, then
+launch through Foch so the native plugin loads. `tools/verify_e2e_offline.py`
+checks that companion, assembles `target/e2e-pkg/trade-blackhole`, and runs
+`foch check`, `plugin import`, `enable`, `plan`, and `launch --prepare-only`
+without starting `eu4.exe`.
 
 ## Configuration and presets
 
@@ -134,13 +144,13 @@ uv run plugins/eu4-dynamic-trade-blackhole/tools/presets.py --playset custom --p
 | `sandbox` | `observe` | Master switch off (`enabled = false`, `observer_log = true`) — inert first-run sanity check |
 
 `tools/presets.py` is idempotent: re-running updates only
-`Acture/eu4-dynamic-trade-blackhole` under the target playset and preserves
+`dev.foch.eu4-dynamic-trade-blackhole` under the target playset and preserves
 all other playsets and plugin configurations.
 
 ### Configuration reference
 
 Individual keys can be overridden under
-`[playsets.<name>.plugins."Acture/eu4-dynamic-trade-blackhole".config]`:
+`[playsets.<name>.plugins."dev.foch.eu4-dynamic-trade-blackhole".config]`:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |

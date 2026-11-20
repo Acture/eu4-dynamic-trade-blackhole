@@ -1,0 +1,6 @@
+﻿l_english:
+ foch_dtb_status_title:0 "Dynamic Trade Blackhole"
+ foch_dtb_status_desc:0 "Read how this companion relates to the Foch runtime plugin. Taking this decision changes no trade route, treasury, or vanilla file."
+ foch_dtb_info.1.t:0 "Dynamic Trade Blackhole"
+ foch_dtb_info.1.d:0 "Dynamic Trade Blackhole runs as a Foch native plugin, not as this script. Launch Europa Universalis IV with foch plugin launch after foch plugin enable dev.foch.eu4-dynamic-trade-blackhole. This message does not change the campaign. Ironman stays unavailable while a native plugin is loaded."
+ foch_dtb_info.1.a:0 "Understood"

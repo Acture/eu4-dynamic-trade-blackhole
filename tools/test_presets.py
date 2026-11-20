@@ -7,7 +7,7 @@ import tomllib
 from pathlib import Path
 
 TOOL = Path(__file__).with_name("presets.py")
-ID = "Acture/eu4-dynamic-trade-blackhole"
+ID = "dev.foch.eu4-dynamic-trade-blackhole"
 
 def run(*args: str, env_home: Path) -> subprocess.CompletedProcess:
     import os

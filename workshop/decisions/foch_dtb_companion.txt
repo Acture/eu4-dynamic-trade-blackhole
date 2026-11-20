@@ -1,0 +1,19 @@
+country_decisions = {
+	# Optional status button for the human player. Not major, so it does not
+	# raise the decision alert, and the AI never sees it. The effect only
+	# opens an informational event.
+	foch_dtb_status = {
+		potential = {
+			ai = no
+		}
+		allow = {
+			always = yes
+		}
+		effect = {
+			country_event = { id = foch_dtb_info.1 }
+		}
+		ai_will_do = {
+			factor = 0
+		}
+	}
+}

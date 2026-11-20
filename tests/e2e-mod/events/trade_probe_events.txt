@@ -20,7 +20,7 @@ country_event = {
 #test(time=1444.11.11, tag=SWE, name="receipts_reach_the_judge",
 #     advance_days=200,
 #     expect_receipt = {
-#         plugin = "Acture/eu4-dynamic-trade-blackhole"
+#         plugin = "dev.foch.eu4-dynamic-trade-blackhole"
 #         case = policy_month
 #         request = 6
 #         type = edge_flip
