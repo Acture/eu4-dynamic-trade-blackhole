@@ -1,4 +1,8 @@
+![Dynamic Trade Blackhole — Emergent End Nodes & Reversible Trade Routes](workshop/thumbnail.png)
+
 # EU4 Dynamic Trade Blackhole
+
+> Steam Workshop companion mod & store copy: [descriptor.mod](workshop/descriptor.mod) · [foch-companion.toml](workshop/foch-companion.toml) · [English BBCode](workshop/STEAM_WORKSHOP_EN.bbcode) · [中文 BBCode](workshop/STEAM_WORKSHOP_ZH.bbcode)
 
 A native DLL plugin (built on the [Foch](https://github.com/Acture/foch)
 runtime host) that makes EU4's trade topology **dynamic**: instead of trade
