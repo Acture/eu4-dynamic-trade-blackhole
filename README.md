@@ -2,7 +2,7 @@
 
 # EU4 Dynamic Trade Blackhole
 
-> Steam Workshop companion mod & store copy: [descriptor.mod](workshop/descriptor.mod) · [foch-companion.toml](workshop/foch-companion.toml) · [English BBCode](workshop/STEAM_WORKSHOP_EN.bbcode) · [中文 BBCode](workshop/STEAM_WORKSHOP_ZH.bbcode)
+> Steam Workshop companion mod & store copy: [descriptor.mod](workshop/descriptor.mod) · [foch.toml](workshop/foch.toml) · [English BBCode](workshop/STEAM_WORKSHOP_EN.bbcode) · [中文 BBCode](workshop/STEAM_WORKSHOP_ZH.bbcode)
 
 A native DLL plugin (built on the [Foch](https://github.com/Acture/foch)
 runtime host) that makes EU4's trade topology **dynamic**: instead of trade
@@ -117,9 +117,10 @@ plugin id. After re-importing a rebuilt package, remove any older
 `0.0.1+<hash>` store directory if `foch plugin enable` reports multiple
 installed digests for the same version.
 
-The Steam Workshop companion lives in `workshop/`: a descriptor, one optional
-human-only decision, and one informational event. It does not edit trade
-nodes or any other vanilla file. Subscribe to it for the playset entry, then
+The Steam Workshop companion lives in `workshop/`: `foch.toml` declares this
+plugin in `[[plugins]]`, next to a descriptor, one optional human-only
+decision, and one informational event. It does not edit trade nodes or any
+other vanilla file. Subscribe to it for the playset entry, then
 launch through Foch so the native plugin loads. `tools/verify_e2e_offline.py`
 checks that companion, assembles `target/e2e-pkg/trade-blackhole`, and runs
 `foch check`, `plugin import`, `enable`, `plan`, and `launch --prepare-only`

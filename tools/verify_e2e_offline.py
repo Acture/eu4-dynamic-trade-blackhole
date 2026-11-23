@@ -98,13 +98,21 @@ def check_companion_files() -> None:
 	):
 		require(needle in descriptor, f"descriptor.mod is missing {needle}")
 	require((WORKSHOP / "thumbnail.png").is_file(), "thumbnail.png is missing")
-	companion = tomllib.loads((WORKSHOP / "foch-companion.toml").read_text(encoding="utf-8"))
-	require(companion.get("schema") == 1, "foch-companion.toml schema")
-	require(companion.get("plugin_id") == PLUGIN_ID, "foch-companion.toml plugin_id")
-	require(companion.get("game") == "eu4", "foch-companion.toml game")
-	require(companion.get("game_versions") == "=1.37.5", "foch-companion.toml game_versions")
-	require(companion.get("repo") == "Acture/eu4-dynamic-trade-blackhole", "foch-companion.toml repo")
-	require(companion.get("requires_foch") is True, "foch-companion.toml requires_foch")
+	require(not (WORKSHOP / "foch-companion.toml").exists(), "foch-companion.toml must be removed")
+	manifest = tomllib.loads((WORKSHOP / "foch.toml").read_text(encoding="utf-8"))
+	require("project" not in manifest, "workshop/foch.toml must not carry a [project] table")
+	plugins = manifest.get("plugins")
+	require(
+		isinstance(plugins, list) and len(plugins) == 1,
+		"workshop/foch.toml must contain one [[plugins]] entry",
+	)
+	plugin = plugins[0]
+	require(isinstance(plugin, dict), "workshop/foch.toml [[plugins]] entry")
+	require(plugin.get("id") == PLUGIN_ID, "foch.toml plugin id")
+	require(plugin.get("repo") == "Acture/eu4-dynamic-trade-blackhole", "foch.toml repo")
+	require(plugin.get("game") == "eu4", "foch.toml game")
+	require(plugin.get("game_versions") == "=1.37.5", "foch.toml game_versions")
+	require(plugin.get("required") is True, "foch.toml required")
 	decision = (WORKSHOP / "decisions" / "foch_dtb_companion.txt").read_text(encoding="utf-8")
 	require("foch_dtb_status" in decision and "foch_dtb_info.1" in decision, "decision is incomplete")
 	event = (WORKSHOP / "events" / "foch_dtb_companion.txt").read_text(encoding="utf-8")

@@ -1,6 +1,0 @@
-schema = 1
-plugin_id = "dev.foch.eu4-dynamic-trade-blackhole"
-game = "eu4"
-game_versions = "=1.37.5"
-repo = "Acture/eu4-dynamic-trade-blackhole"
-requires_foch = true
