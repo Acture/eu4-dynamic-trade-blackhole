@@ -44,8 +44,9 @@ pub struct NodeSnapshot {
 	/// wealth center of its region?).
 	pub tax: f64,
 	/// The engine's own retention rate: retained / (retained +
-	/// transferred), from node+0xb0 and +0xbc. This reflects the actual
-	/// game mechanics — trade power shares, merchant modes, modifiers.
+	/// transferred), from the node's value and transferred fields. This
+	/// reflects the actual game mechanics — trade power shares, merchant
+	/// modes, modifiers.
 	/// Used by the propagation to determine how much value stays.
 	pub retention: f64,
 	/// Local trade value (production × price): the injection.

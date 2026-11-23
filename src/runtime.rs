@@ -18,17 +18,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::config::Config;
 use crate::engine::{Engine, EngineBackend};
 use crate::policy::NodeSnapshot;
-use foch_runtime::dataplane::{self, Eu4Game, Memory, NodeView, RouteMutation, TradeNodes};
+use foch_runtime::dataplane::{self, Eu4Game, NodeView, RouteMutation, TradeNodes};
 
 type LiveEngine = Engine<LiveBackend, fn(i32, &str)>;
 
 static ENGINE: OnceLock<Mutex<LiveEngine>> = OnceLock::new();
 static EXE_BASE: AtomicUsize = AtomicUsize::new(0);
-
-/// Internal-key SSO at the start of a `CTradeRoute`. Typed route views
-/// expose the target definition and the live count, not this string.
-/// `node_members.txt` is keyed by it, so the fallback walk still reads it.
-const ROUTE_KEY: usize = 0x10;
 
 /// The host-reported image base of this process's `eu4.exe`.
 /// Install the engine the economy-update detour drives. `exe_base` is the
@@ -74,7 +69,7 @@ fn parse_members(bytes: &[u8]) -> Vec<(String, Vec<u32>)> {
 /// Where a node's member-province list came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemberSource {
-	/// `NodeView::member_provinces` (`CTradeNodeDefinition + 0x50`).
+	/// `NodeView::member_provinces`.
 	/// Statically identified for EU4 1.37.5; pending live verification.
 	LiveVector,
 	/// Offline `node_members.txt` from `tools/gen_members.py`.
@@ -102,7 +97,7 @@ fn member_source_summary(
 	static_nodes: usize,
 ) -> String {
 	format!(
-		"tax aggregated for {covered}/{count} nodes; member source: {live_nodes} live vector (CTradeNodeDefinition+0x50, statically identified, pending live verification), {static_nodes} static node_members.txt",
+		"tax aggregated for {covered}/{count} nodes; member source: {live_nodes} live vector (CTradeNodeDefinition members, statically identified, pending live verification), {static_nodes} static node_members.txt",
 	)
 }
 
@@ -134,8 +129,6 @@ struct CapturedRoute {
 /// on the game thread inside the recalculation hook, so the database and
 /// its nodes are stable for the whole call.
 pub struct LiveBackend {
-	/// The shared data plane every guarded access goes through.
-	memory: Memory,
 	/// The global game context, kept for [`Eu4Game::from_tick`].
 	context: usize,
 	/// Image base captured for this backend. Zero falls back to [`EXE_BASE`].
@@ -180,7 +173,6 @@ impl LiveBackend {
 		sink_basis: crate::config::SinkBasis,
 	) -> Self {
 		Self {
-			memory: Memory,
 			context: 0,
 			exe_base: 0,
 			mutations: HashMap::new(),
@@ -214,7 +206,7 @@ impl LiveBackend {
 	/// is available. Member provinces come from
 	/// [`NodeView::member_provinces`]. `None` or an empty vector falls
 	/// back to the offline `node_members.txt` table. That table is keyed
-	/// by the internal route key, which the typed views do not surface.
+	/// by the internal route key from [`NodeView::route_target_key`].
 	fn aggregate_taxes(&mut self, count: usize) {
 		// Re-aggregate every 6 months alongside the evidence window:
 		// province development changes tax and manpower, and the sink
@@ -241,7 +233,7 @@ impl LiveBackend {
 				let Some(view) = trade.node(index) else {
 					continue;
 				};
-				self.collect_route_keys(&trade, &view, &mut key_by_def);
+				Self::collect_route_keys(&trade, &view, &mut key_by_def);
 			}
 		}
 		let mut live_nodes = 0usize;
@@ -312,15 +304,14 @@ impl LiveBackend {
 	}
 
 	/// Read each live route's internal key and remember it under the
-	/// target definition. The stride is the public route span divided by
-	/// [`NodeView::live_route_count`], so the walk does not carry a size
-	/// constant. An empty vector contributes nothing.
-	fn collect_route_keys(
-		&self,
-		nodes: &TradeNodes,
-		view: &NodeView,
-		into: &mut HashMap<usize, String>,
-	) {
+	/// target definition. Keys come from [`NodeView::route_target_key`]
+	/// (the same string as [`TradeNodes::route_target_key`] and one entry
+	/// of [`NodeView::outgoing_target_keys`]). The stride is the public
+	/// route span divided by [`NodeView::live_route_count`], so the walk
+	/// does not carry a size constant. One unreadable key is skipped;
+	/// [`NodeView::outgoing_target_keys`] would drop the whole vector.
+	/// An empty vector contributes nothing.
+	fn collect_route_keys(nodes: &TradeNodes, view: &NodeView, into: &mut HashMap<usize, String>) {
 		let Some(routes) = view.live_route_count(nodes) else {
 			return;
 		};
@@ -347,10 +338,7 @@ impl LiveBackend {
 			if into.contains_key(&target) {
 				continue;
 			}
-			let Some(key_at) = addr.checked_add(ROUTE_KEY) else {
-				continue;
-			};
-			if let Some(key) = dataplane::read_sso(&self.memory, key_at, dataplane::is_key_byte) {
+			if let Some(key) = view.route_target_key(addr) {
 				into.insert(target, key);
 			}
 		}
@@ -788,13 +776,13 @@ only-a-key"
 	}
 
 	#[test]
-	fn member_source_log_names_the_static_offset_and_which_table_won() {
+	fn member_source_log_names_which_table_won() {
 		let text = member_source_summary(2, 3, 1, 1);
 		assert!(text.contains("2/3"));
 		assert!(text.contains("1 live vector"));
 		assert!(text.contains("1 static node_members.txt"));
-		assert!(text.contains("0x50"));
 		assert!(text.contains("pending live verification"));
+		assert!(!text.contains("0x"));
 	}
 
 	#[cfg(windows)]
@@ -861,8 +849,17 @@ only-a-key"
 
 	/// Write the internal key of node 0's first outgoing route. The scene
 	/// must already contain that route, and must stay alive across the write.
+	///
+	/// `ROUTE_TARGET_KEY` is `route.target_key` on the compiled-in 1.37.5
+	/// profile. Production reads that field through
+	/// [`NodeView::route_target_key`]; the profile keeps the offset private,
+	/// so only this plant names it. The following two stores are the MSVC
+	/// inline-string length and capacity, not a trade-route field.
 	#[cfg(windows)]
 	fn plant_route_key(scene: &mut FakeGame, key: &str) {
+		const ROUTE_TARGET_KEY: usize = 0x10;
+		const SSO_LENGTH: usize = 0x10;
+		const SSO_CAPACITY: usize = 0x18;
 		let game = scene.game().expect("scene");
 		let nodes = game.trade_nodes().expect("nodes");
 		let view = nodes.node(0).expect("node");
@@ -871,23 +868,24 @@ only-a-key"
 		assert!(count >= 1, "the key lives on an outgoing route");
 		let slot = begin;
 		let stride = (end - begin) / count;
-		assert!(stride > super::ROUTE_KEY);
-		let key_at = slot + super::ROUTE_KEY;
+		assert!(stride > ROUTE_TARGET_KEY);
+		let key_at = slot + ROUTE_TARGET_KEY;
 		let memory = game.memory;
 		// SAFETY: `scene` owns the route allocation for this call, and the
-		// test is the only writer. The bytes are the inline SSO the fallback
-		// reader expects.
+		// test is the only writer. The bytes are the inline SSO
+		// `NodeView::route_target_key` reads back.
 		unsafe {
 			memory
 				.write_bytes(key_at, key.as_bytes())
 				.expect("key bytes");
 			memory
-				.write_qword(key_at + 0x10, key.len() as u64)
+				.write_qword(key_at + SSO_LENGTH, key.len() as u64)
 				.expect("key length");
 			memory
-				.write_qword(key_at + 0x18, 0xF)
+				.write_qword(key_at + SSO_CAPACITY, 0xF)
 				.expect("key capacity");
 		}
+		assert_eq!(view.route_target_key(slot).as_deref(), Some(key));
 	}
 
 	#[cfg(windows)]
