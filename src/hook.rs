@@ -1,17 +1,16 @@
 //! The economy-update detour riding the game thread.
 //!
-//! The spike pinned the hook target to the economy update that ends by
-//! recalculating every trade node (see [`crate::offsets::Sigs::tick`]):
-//! `fn(context: &GameContext, flag: u8)`. The detour always calls the
-//! original first, then runs one step; the trade database is the context
-//! object at a fixed offset, cross-checked against the context global
-//! before use. The host chains further detours through the same cell.
+//! The pinned target is the economy update that ends by recalculating
+//! every trade node: `fn(context: &GameContext, flag: u8)`, resolved by
+//! [`foch_runtime::dataplane::resolve_monthly_tick`]. The detour always
+//! calls the original first, then runs one step.
+//! [`foch_runtime::dataplane::Eu4Game::from_tick`]
+//! cross-checks the context argument against the context global before
+//! any trade read. The host chains further detours through the same cell.
 
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-use crate::offsets::layout;
 
 /// The host-owned next cell, installed once by `init` when the hook is
 /// created. Re-read on every call: the host relinks the chain under us.
@@ -48,8 +47,7 @@ fn original(context: *mut c_void, flag: u8) {
 pub unsafe extern "C" fn economy_update_detour(context: *mut c_void, flag: u8) {
 	original(context, flag);
 	if RUN.load(Ordering::Acquire) {
-		let db = context as usize + layout::DB_IN_CONTEXT;
-		let step = move || crate::runtime::monthly(context as usize, db);
+		let step = move || crate::runtime::monthly(context as usize);
 		if std::panic::catch_unwind(AssertUnwindSafe(step)).is_err() {
 			RUN.store(false, Ordering::Release);
 			crate::state::set_failed_after_panic();

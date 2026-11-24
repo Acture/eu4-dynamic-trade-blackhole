@@ -1,13 +1,14 @@
-//! The live engine backend over the reversed trade structures, plus the
+//! The live engine backend over the typed trade views, plus the
 //! recalculation entry the detour drives.
 //!
-//! The hook hands the database pointer to [`monthly`]; the backend walks
-//! `CTradeNodeDataBase` exactly as the RE spike documented it (see
-//! [`crate::offsets::layout`]). M1 mutation granularity is whole-node:
-//! closing swaps the route vector's end back to its begin (an empty vector
-//! is the engine's own representation of an end node) and reopening
-//! restores the cached original end. Per-edge flips with entry reordering
-//! arrive with the policy milestone.
+//! [`monthly`] resolves the hook's context with
+//! [`foch_runtime::dataplane::Eu4Game::from_tick`]. Node, route, tax,
+//! participant, and treasury access then go through [`TradeNodes`],
+//! [`NodeView`], [`Province`], [`Eu4Game::pay_country`], and
+//! [`RouteMutation`]. Closing one vanilla edge rewrites that node's live
+//! route vector from the captured original: open entries stay first,
+//! closed entries park at the tail, and the vector end shrinks to the
+//! open prefix.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -16,8 +17,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::Config;
 use crate::engine::{Engine, EngineBackend};
-use crate::offsets::layout;
 use crate::policy::NodeSnapshot;
+use foch_runtime::dataplane::{self, Eu4Game, NodeView, RouteMutation, TradeNodes};
 
 type LiveEngine = Engine<LiveBackend, fn(i32, &str)>;
 
@@ -65,65 +66,75 @@ fn parse_members(bytes: &[u8]) -> Vec<(String, Vec<u32>)> {
 	out
 }
 
+/// Where a node's member-province list came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemberSource {
+	/// `NodeView::member_provinces`.
+	/// Statically identified for EU4 1.37.5; pending live verification.
+	LiveVector,
+	/// Offline `node_members.txt` from `tools/gen_members.py`.
+	StaticTable,
+}
+
+/// Prefer the live member vector. `None` or an empty vector falls back to
+/// the offline table; an empty table entry is not a usable member list.
+fn resolve_members(
+	live: Option<&[u32]>,
+	static_ids: Option<&[u32]>,
+) -> Option<(MemberSource, Vec<u32>)> {
+	if let Some(ids) = live.filter(|ids| !ids.is_empty()) {
+		return Some((MemberSource::LiveVector, ids.to_vec()));
+	}
+	static_ids
+		.filter(|ids| !ids.is_empty())
+		.map(|ids| (MemberSource::StaticTable, ids.to_vec()))
+}
+
+fn member_source_summary(
+	covered: usize,
+	count: usize,
+	live_nodes: usize,
+	static_nodes: usize,
+) -> String {
+	format!(
+		"tax aggregated for {covered}/{count} nodes; member source: {live_nodes} live vector (CTradeNodeDefinition members, statically identified, pending live verification), {static_nodes} static node_members.txt",
+	)
+}
+
 /// One economy-update step on the game thread. `context` is the hook's
-/// first argument and `db` the embedded trade database; both are validated
-/// against the context global before the engine touches anything.
-pub fn monthly(context: usize, db: usize) {
+/// first argument; it is accepted only when it matches the pinned global.
+pub fn monthly(context: usize) {
 	let Some(engine) = ENGINE.get() else { return };
 	let base = EXE_BASE.load(Ordering::Acquire);
-	if base > 0x1_0000 {
-		let stored =
-			unsafe { std::ptr::read((base + layout::CONTEXT_GLOBAL_RVA) as *const u64) } as usize;
-		if stored != context {
-			crate::logging::write(
-				crate::logging::WARN,
-				&format!(
-					"context 0x{context:x} is not the global 0x{stored:x}; skipping this update"
-				),
-			);
-			return;
-		}
+	if Eu4Game::from_tick(base, context).is_none() {
+		crate::logging::write(
+			crate::logging::WARN,
+			&format!("context 0x{context:x} is not the global; skipping this update"),
+		);
+		return;
 	}
 	if let Ok(mut engine) = engine.lock() {
-		engine.set_source(context, db);
+		engine.set_source(context, context);
 		engine.tick();
 	}
 }
 
-/// The per-node mutation state: the vanilla route entries and steering
-/// weights captured before the first mutation, plus the live closed flags.
-/// Applying a state rewrites the live arrays from the originals with the
-/// open entries first and parks the closed ones at the tail, then shrinks
-/// the vector's end — so any open subset is a contiguous, legal vector
-/// and restoring every flag rebuilds the exact vanilla layout.
-struct NodeMutation {
-	def: usize,
-	routes_begin: usize,
-	original_routes: Vec<u8>,
-	weights_begin: Option<usize>,
-	original_weights: Vec<i32>,
-	closed: Vec<bool>,
-}
-
-/// The live slot order for vanilla edges with the given closed flags:
-/// open vanilla slots first in vanilla order, closed slots parked at the
-/// tail. Pure, so the ordering is unit-tested without engine memory.
-fn live_order(closed: &[bool]) -> Vec<usize> {
-	let open = (0..closed.len()).filter(|i| !closed[*i]);
-	let shut = (0..closed.len()).filter(|i| closed[*i]);
-	open.chain(shut).collect()
+/// Vanilla route capture plus the edge count frozen before the first shrink.
+struct CapturedRoute {
+	mutation: RouteMutation,
+	edges: usize,
 }
 
 /// Reads and mutates the engine's trade structures. Every access happens
 /// on the game thread inside the recalculation hook, so the database and
-/// its nodes are stable for the whole call; reads still guard against
-/// implausible addresses instead of trusting the layout blindly.
+/// its nodes are stable for the whole call.
 pub struct LiveBackend {
-	db: usize,
-	/// The global game context, kept for the context cross-check.
+	/// The global game context, kept for [`Eu4Game::from_tick`].
 	context: usize,
+	/// Image base captured for this backend. Zero falls back to [`EXE_BASE`].
+	exe_base: usize,
 	/// Per-node mutation state, captured before the first mutation.
-	mutations: HashMap<u32, NodeMutation>,
+	mutations: HashMap<u32, CapturedRoute>,
 	/// Vanilla outgoing targets per node index, frozen at the first
 	/// observe and reported from cache afterwards.
 	vanilla_outgoing: HashMap<u32, Vec<u32>>,
@@ -139,11 +150,14 @@ pub struct LiveBackend {
 	entry_logged: bool,
 	/// Whether the one-shot country probe already ran.
 	countries_probed: bool,
+	/// Whether the modded-trade-map warning already fired.
+	members_warned: bool,
 	/// Offline node-members table: internal key -> member province ids,
 	/// shipped in the plugin package (generated from 00_tradenodes.txt).
+	/// Used when the live member vector is missing or empty.
 	member_ids: HashMap<String, Vec<u32>>,
 	/// Per-node-index sink signal, built at the first observe from the
-	/// members' CProvince base tax: the per-province mean or the sum.
+	/// members' province base tax: the per-province mean or the sum.
 	node_tax: HashMap<u32, f64>,
 	/// Which basis `node_tax` holds.
 	sink_basis: crate::config::SinkBasis,
@@ -159,8 +173,8 @@ impl LiveBackend {
 		sink_basis: crate::config::SinkBasis,
 	) -> Self {
 		Self {
-			db: 0,
 			context: 0,
+			exe_base: 0,
 			mutations: HashMap::new(),
 			vanilla_outgoing: HashMap::new(),
 			names: Vec::new(),
@@ -169,16 +183,30 @@ impl LiveBackend {
 			observes: 0,
 			entry_logged: false,
 			countries_probed: false,
+			members_warned: false,
 			member_ids: members.into_iter().collect(),
 			node_tax: HashMap::new(),
 			sink_basis,
 		}
 	}
 
+	fn resolved_base(&self) -> usize {
+		if self.exe_base > 0x1_0000 {
+			self.exe_base
+		} else {
+			EXE_BASE.load(Ordering::Acquire)
+		}
+	}
+
+	fn game(&self) -> Option<Eu4Game> {
+		Eu4Game::from_tick(self.resolved_base(), self.context)
+	}
+
 	/// Sum the members' base tax for every node, once the province array
-	/// and the key->definition mapping are available. A node's internal
-	/// key is read from any incoming route entry (the entry carries the
-	/// target's key), so no localization-dependent name is involved.
+	/// is available. Member provinces come from
+	/// [`NodeView::member_provinces`]. `None` or an empty vector falls
+	/// back to the offline `node_members.txt` table. That table is keyed
+	/// by the internal route key from [`NodeView::route_target_key`].
 	fn aggregate_taxes(&mut self, count: usize) {
 		// Re-aggregate every 6 months alongside the evidence window:
 		// province development changes tax and manpower, and the sink
@@ -186,74 +214,63 @@ impl LiveBackend {
 		if !self.node_tax.is_empty() && !self.observes.is_multiple_of(6) {
 			return;
 		}
-		if self.member_ids.is_empty() {
-			return;
-		}
 		self.node_tax.clear();
-		let Some(cprov_base) = self
-			.read_qword(self.context + layout::province::CPROVINCES)
-			.map(|p| p as usize)
-			.filter(|p| *p > 0x1_0000)
-		else {
+		let Some(game) = self.game() else {
 			return;
 		};
-		// Route entries name their target: entry+0x10 holds the target's
-		// internal key, entry+0x30 the target definition pointer.
+		// `province(0)` only checks that the province array pointer is
+		// plausible. During Late History that pointer is not yet safe;
+		// retrying on a later observe is the load-phase gate.
+		if game.province(0).is_none() {
+			return;
+		}
+		let Some(trade) = game.trade_nodes() else {
+			return;
+		};
 		let mut key_by_def: HashMap<usize, String> = HashMap::new();
-		for index in 0..count {
-			let Some(node) = self.node_at(index) else {
-				continue;
-			};
-			let Some(def) = self.definition_of(node) else {
-				continue;
-			};
-			let Some((begin, end)) = self.routes(def) else {
-				continue;
-			};
-			for slot in (begin..end).step_by(layout::route::SIZE) {
-				let Some(target) = self
-					.read_qword(slot + layout::route::TARGET)
-					.map(|p| p as usize)
-				else {
+		if !self.member_ids.is_empty() {
+			for index in 0..count {
+				let Some(view) = trade.node(index) else {
 					continue;
 				};
-				if key_by_def.contains_key(&target) {
-					continue;
-				}
-				if let Some(key) = self.read_sso_key(slot + 0x10) {
-					key_by_def.insert(target, key);
-				}
+				Self::collect_route_keys(&trade, &view, &mut key_by_def);
 			}
 		}
+		let mut live_nodes = 0usize;
+		let mut static_nodes = 0usize;
 		for index in 0..count {
-			let Some(node) = self.node_at(index) else {
+			let Some(view) = trade.node(index) else {
 				continue;
 			};
-			let Some(def) = self.definition_of(node) else {
+			let live = view.member_provinces();
+			let static_ids = self.static_member_ids(view.definition, &key_by_def);
+			let Some((source, ids)) = resolve_members(live.as_deref(), static_ids.as_deref())
+			else {
 				continue;
 			};
-			let Some(key) = key_by_def.get(&def) else {
-				continue;
-			};
-			let Some(ids) = self.member_ids.get(key) else {
-				continue;
-			};
+			match source {
+				MemberSource::LiveVector => live_nodes += 1,
+				MemberSource::StaticTable => static_nodes += 1,
+			}
 			let mut sum = 0.0;
 			let mut manpower_sum = 0.0;
 			let mut counted = 0.0;
-			for id in ids {
-				let base = cprov_base + *id as usize * layout::province::CPROVINCE_SIZE;
-				if let Some(tax) = self.read_i32(base + layout::province::TAX) {
-					sum += tax as f64;
-					// Manpower is potential consumption: a large population
-					// represents purchasing power that tax alone understates.
-					// It joins the sink signal at half weight so tax stays
-					// the dominant expression of current wealth.
-					if let Some(man) = self.read_i32(base + layout::province::MANPOWER) {
-						manpower_sum += man as f64;
-					}
-					counted += 1.0;
+			for id in &ids {
+				let Some(province) = game.province(*id) else {
+					continue;
+				};
+				let Some(tax) = province.tax() else {
+					continue;
+				};
+				sum += tax as f64;
+				// Manpower is potential consumption: a large population
+				// represents purchasing power that tax alone understates.
+				// It joins the sink signal at half weight so tax stays
+				// the dominant expression of current wealth.
+				if let Some(man) = province.manpower() {
+					manpower_sum += man as f64;
 				}
+				counted += 1.0;
 			}
 			// The mean expresses wealth intensity; the raw sum expresses
 			// mass. A big reworked region full of poor provinces wins the
@@ -268,138 +285,120 @@ impl LiveBackend {
 		}
 		crate::logging::write(
 			crate::logging::INFO,
-			&format!("tax aggregated for {}/{} nodes", self.node_tax.len(), count),
+			&member_source_summary(self.node_tax.len(), count, live_nodes, static_nodes),
 		);
+		// A modded trade map replaces the nodes the offline members
+		// table was built from: tax coverage collapses while the rest of
+		// the policy (flow, fees, gazette) keeps working. Name the fix
+		// once per session instead of failing silently.
+		let covered = self.node_tax.len();
+		if covered * 4 < count * 3 && !self.members_warned {
+			self.members_warned = true;
+			crate::logging::write(
+				crate::logging::WARN,
+				&format!(
+					"tax covers only {covered}/{count} nodes: the members table does not cover this trade map; regenerate it with tools/gen_members.py --game <EU4> --playset <dlc_load.json> --out node_members.txt"
+				),
+			);
+		}
 	}
 
-	/// Read an MSVC SSO string holding an internal key (`a-z0-9_`).
-	fn read_sso_key(&self, addr: usize) -> Option<String> {
-		let length = self.read_qword(addr + 0x10)? as usize;
-		if length == 0 || length > 64 {
-			return None;
-		}
-		let capacity = self.read_qword(addr + 0x18)?;
-		let data = if capacity > 0xF {
-			self.read_qword(addr)? as usize
-		} else {
-			addr
+	/// Read each live route's internal key and remember it under the
+	/// target definition. Keys come from [`NodeView::route_target_key`]
+	/// (the same string as [`TradeNodes::route_target_key`] and one entry
+	/// of [`NodeView::outgoing_target_keys`]). The stride is the public
+	/// route span divided by [`NodeView::live_route_count`], so the walk
+	/// does not carry a size constant. One unreadable key is skipped;
+	/// [`NodeView::outgoing_target_keys`] would drop the whole vector.
+	/// An empty vector contributes nothing.
+	fn collect_route_keys(nodes: &TradeNodes, view: &NodeView, into: &mut HashMap<usize, String>) {
+		let Some(routes) = view.live_route_count(nodes) else {
+			return;
 		};
-		let mut bytes = Vec::with_capacity(length);
-		for i in 0..length {
-			let byte = self.read_i32(data + i)? as u8;
-			if !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && byte != b'_' {
-				return None;
-			}
-			bytes.push(byte);
+		if routes == 0 {
+			return;
 		}
-		String::from_utf8(bytes).ok()
+		let Some((begin, end)) = nodes.routes(view.definition) else {
+			return;
+		};
+		let stride = (end - begin) / routes;
+		if stride == 0 {
+			return;
+		}
+		for slot in 0..routes {
+			let Some(offset) = slot.checked_mul(stride) else {
+				continue;
+			};
+			let Some(addr) = begin.checked_add(offset) else {
+				continue;
+			};
+			let Some(target) = view.route_target(addr) else {
+				continue;
+			};
+			if into.contains_key(&target) {
+				continue;
+			}
+			if let Some(key) = view.route_target_key(addr) {
+				into.insert(target, key);
+			}
+		}
 	}
 
-	fn read_qword(&self, addr: usize) -> Option<u64> {
-		(addr > 0x1_0000 && addr & 7 == 0).then(|| unsafe { std::ptr::read(addr as *const u64) })
-	}
-
-	fn read_i32(&self, addr: usize) -> Option<i32> {
-		(addr > 0x1_0000).then(|| unsafe { std::ptr::read_unaligned(addr as *const i32) })
-	}
-
-	/// One byte, for the SSO-string and route-byte walks: reading four
-	/// bytes where one is walked risks touching the page after the
-	/// object near a segment boundary.
-	fn read_u8(&self, addr: usize) -> Option<u8> {
-		(addr > 0x1_0000).then(|| unsafe { std::ptr::read(addr as *const u8) })
-	}
-
-	fn write_qword(&self, addr: usize, value: u64) -> Option<()> {
-		(addr > 0x1_0000 && addr & 7 == 0)
-			.then(|| unsafe { std::ptr::write(addr as *mut u64, value) })
-	}
-
-	fn write_i32(&self, addr: usize, value: i32) -> Option<()> {
-		(addr > 0x1_0000).then(|| unsafe { std::ptr::write_unaligned(addr as *mut i32, value) })
+	/// The offline table row for one definition. The key is the string an
+	/// incoming route recorded; missing when that route or the table row
+	/// is absent.
+	fn static_member_ids(
+		&self,
+		definition: usize,
+		key_by_def: &HashMap<usize, String>,
+	) -> Option<Vec<u32>> {
+		let key = key_by_def.get(&definition)?;
+		self.member_ids.get(key).cloned()
 	}
 
 	/// One-shot diagnostic: a few countries' tag and treasury, so the
 	/// e2e probe (a known `add_treasury` effect) can pin the field's unit.
 	fn probe_countries(&self) {
-		let base = EXE_BASE.load(Ordering::Acquire);
-		if base <= 0x1_0000 {
-			return;
-		}
-		let manager_raw = self.read_qword(base + layout::COUNTRY_MANAGER_GLOBAL_RVA);
-		crate::logging::write(
-			crate::logging::DEBUG,
-			&format!("country probe: manager global reads {manager_raw:?}"),
-		);
-		let Some(manager) = manager_raw.map(|p| p as usize).filter(|p| *p > 0x1_0000) else {
-			return;
-		};
-		for (label, offset) in [("count_1d14", 0x1d14usize), ("count_1d10", 0x1d10)] {
-			crate::logging::write(
-				crate::logging::DEBUG,
-				&format!(
-					"country probe: {label} reads {:?}",
-					self.read_i32(manager + offset)
-				),
-			);
-		}
 		let Some(count) = self.country_count() else {
+			crate::logging::write(crate::logging::DEBUG, "country probe: registry unavailable");
 			return;
 		};
-		let Some(pointers) = self
-			.read_qword(manager + layout::country_manager::INDEX_ARRAY)
-			.map(|p| p as usize)
-			.filter(|p| *p > 0x1_0000)
-		else {
+		let Some(countries) = self.game().and_then(|game| game.countries()) else {
 			return;
 		};
 		let mut lines = Vec::new();
 		for index in 0..count.min(6) {
-			let Some(country) = self
-				.read_qword(pointers + index * 8)
-				.map(|p| p as usize)
-				.filter(|p| *p > 0x1_0000)
-			else {
+			let Some(country) = countries.country(index) else {
 				continue;
 			};
-			let tag = self.read_tag(country);
-			let treasury = self.read_i32(country + layout::country::TREASURY);
-			lines.push(format!("country {index} tag {tag} treasury {treasury:?}"));
+			lines.push(format!(
+				"country {index} tag {} treasury {:?}",
+				country.tag(),
+				country.treasury()
+			));
 		}
 		crate::logging::write(
 			crate::logging::DEBUG,
-			&format!("country probe ({} countries): {}", count, lines.join("; ")),
+			&format!("country probe ({count} countries): {}", lines.join("; ")),
 		);
 	}
 
-	/// The tag embedded in a country's identity qword at +0x20: the low
-	/// bytes as ASCII, up to the first non-tag character.
-	fn read_tag(&self, country: usize) -> String {
-		let Some(packed) = self.read_qword(country + layout::country::TAG) else {
-			return "?".to_string();
-		};
-		let bytes = packed.to_le_bytes();
-		let len = bytes
-			.iter()
-			.position(|b| !b.is_ascii_uppercase() && !b.is_ascii_digit())
-			.unwrap_or(4);
-		String::from_utf8_lossy(&bytes[..len.min(4)]).into_owned()
-	}
-
-	/// The number of countries, from the country vector in the game
-	/// context: the same begin/count pair the distribution loop reads.
+	/// The number of countries [`Eu4Game::countries`] accepts (`1..=i16::MAX`).
 	fn country_count(&self) -> Option<usize> {
-		if self.context == 0 {
-			return None;
-		}
-		let count = self.read_i32(self.context + layout::COUNTRIES_COUNT)? as usize;
-		(1..=1024).contains(&count).then_some(count)
+		let count = self.game()?.countries()?.count();
+		(1..=i16::MAX as usize).contains(&count).then_some(count)
 	}
 
-	fn write_bytes(&self, addr: usize, bytes: &[u8]) -> Option<()> {
-		(addr > 0x1_0000).then(|| unsafe {
-			std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len())
-		})
+	/// Trade-node count through [`Eu4Game::trade_nodes`].
+	///
+	/// The shared gate is `1..=MAX_TRADE_NODES` (4096). Counts below 20
+	/// (small regional maps) and above 512 (total conversions) stay valid;
+	/// only zero, negative, and clearly corrupt counts are rejected.
+	fn node_count(&self) -> Option<usize> {
+		let count = self.game()?.trade_nodes()?.count();
+		(1..=dataplane::game::MAX_TRADE_NODES)
+			.contains(&count)
+			.then_some(count)
 	}
 
 	/// Capture a node's vanilla routes and weights before the first
@@ -408,157 +407,42 @@ impl LiveBackend {
 		if self.mutations.contains_key(&node) {
 			return Ok(());
 		}
-		let address = self
-			.node_at(node as usize)
+		let game = self.game().ok_or("no exe base")?;
+		let nodes = game.trade_nodes().ok_or("implausible node count")?;
+		let view = nodes
+			.node(node as usize)
 			.ok_or("implausible node pointer")?;
-		let def = self
-			.definition_of(address)
-			.ok_or("implausible definition")?;
-		let (begin, end) = self.routes(def).ok_or("implausible route vector")?;
-		let count = (end - begin) / layout::route::SIZE;
-		let mut original_routes = Vec::with_capacity(count * layout::route::SIZE);
-		for offset in 0..count * layout::route::SIZE {
-			let Some(byte) = self.read_i32(begin + offset) else {
-				return Err("route bytes unreadable");
-			};
-			original_routes.push(byte as u8);
-		}
-		// The steering weights pair with the routes entry for entry; when
-		// they do not, route reordering alone still holds and the weights
-		// keep their live order (the pairing diagnostic covers the case).
-		let weights_begin = self
-			.read_qword(address + layout::node::WEIGHTS)
-			.map(|p| p as usize);
-		let weights_end = self
-			.read_qword(address + layout::node::WEIGHTS + 8)
-			.map(|p| p as usize);
-		let paired = matches!((weights_begin, weights_end), (Some(a), Some(e)) if e >= a && (e - a) / 4 == count);
-		let (weights_begin, original_weights) = if paired {
-			let Some(begin) = weights_begin else {
-				unreachable!("paired implies begin")
-			};
-			let mut values = Vec::with_capacity(count);
-			for slot in 0..count {
-				match self.read_i32(begin + slot * 4) {
-					Some(value) => values.push(value),
-					None => return Err("weight bytes unreadable"),
-				}
-			}
-			(Some(begin), values)
-		} else {
-			(None, Vec::new())
-		};
-		self.mutations.insert(
-			node,
-			NodeMutation {
-				def,
-				routes_begin: begin,
-				original_routes,
-				weights_begin,
-				original_weights,
-				closed: vec![false; count],
-			},
-		);
+		let edges = view
+			.live_route_count(&nodes)
+			.ok_or("implausible route vector")?;
+		let mutation = view
+			.capture_routes(&nodes)
+			.ok_or("route bytes unreadable")?;
+		self.mutations
+			.insert(node, CapturedRoute { mutation, edges });
 		Ok(())
 	}
 
-	/// Rewrite a node's live route and weight arrays from the captured
-	/// originals: open entries first, closed entries parked at the tail,
-	/// and the vector end shrunk to the open prefix.
-	fn apply(&self, node: u32) -> Result<(), &'static str> {
-		let Some(state) = self.mutations.get(&node) else {
-			return Ok(());
-		};
-		let stride = layout::route::SIZE;
-		let order = live_order(&state.closed);
-		for (live_slot, vanilla_slot) in order.iter().enumerate() {
-			let source = vanilla_slot * stride;
-			let target = state.routes_begin + live_slot * stride;
-			let bytes = &state.original_routes[source..source + stride];
-			self.write_bytes(target, bytes)
-				.ok_or("route write refused")?;
-			if let (Some(weights_begin), value) = (
-				state.weights_begin,
-				state.original_weights.get(*vanilla_slot).copied(),
-			) {
-				let Some(value) = value else { continue };
-				let addr = weights_begin + live_slot * 4;
-				(addr > 0x1_0000)
-					.then(|| unsafe { std::ptr::write_unaligned(addr as *mut i32, value) })
-					.ok_or("weight write refused")?;
+	/// Steering weights in vanilla edge order. After a mutation the live
+	/// slots hold the open-first permutation.
+	fn vanilla_steering(&self, node: u32, outgoing: usize, weights: &[f64]) -> Vec<f64> {
+		let order = match self.mutations.get(&node) {
+			Some(state) => {
+				let closed: Vec<bool> = (0..state.edges)
+					.map(|edge| state.mutation.is_closed(edge))
+					.collect();
+				dataplane::live_order(&closed)
 			}
-		}
-		// The paired steering-weight vector's end is left untouched: the
-		// engine walks the weights by the route count (the pairing
-		// diagnostic has never tripped in a live session), and the
-		// parked tail entries keep the vector's own length stable for
-		// the observe-side permutation recovery.
-		let open_count = state.closed.iter().filter(|c| !**c).count();
-		let new_end = state.routes_begin + open_count * stride;
-		self.write_qword(state.def + layout::def::ROUTES_END, new_end as u64)
-			.ok_or("end write refused")?;
-		Ok(())
-	}
-
-	fn node_count(&self) -> Option<usize> {
-		let count = self.read_i32(self.db + layout::db::NODE_COUNT)? as usize;
-		(20..=512).contains(&count).then_some(count)
-	}
-
-	fn nodes_base(&self) -> Option<usize> {
-		let base = self.read_qword(self.db + layout::db::NODES)? as usize;
-		(base > 0x1_0000 && base & 7 == 0).then_some(base)
-	}
-
-	/// The node pointer array dereference: element `index` is a heap
-	/// `CTradeNode*`, loaded through one indirection.
-	fn node_at(&self, index: usize) -> Option<usize> {
-		let slot = self.nodes_base()? + index * 8;
-		let node = self.read_qword(slot)? as usize;
-		(node > 0x1_0000 && node & 7 == 0).then_some(node)
-	}
-
-	fn definition_of(&self, node: usize) -> Option<usize> {
-		let def = self.read_qword(node + layout::node::DEFINITION)? as usize;
-		(def > 0x1_0000 && def & 7 == 0).then_some(def)
-	}
-
-	/// MSVC SSO `std::string`: inline buffer unless capacity exceeds 0xF.
-	fn read_name(&self, def: usize) -> Option<String> {
-		let capacity = self.read_qword(def + layout::def::NAME + 0x18)?;
-		let length = self.read_qword(def + layout::def::NAME + 0x10)? as usize;
-		if length == 0 || length > 64 {
-			return None;
-		}
-		let data = if capacity > 0xF {
-			self.read_qword(def + layout::def::NAME)? as usize
-		} else {
-			def + layout::def::NAME
+			None => (0..outgoing).collect(),
 		};
-		let mut bytes = Vec::with_capacity(length);
-		for i in 0..length {
-			let byte = self.read_u8(data + i)?;
-			if !(byte == b' ' || byte.is_ascii_graphic() || byte >= 0x80) {
-				return None;
+		let mut steering = vec![0.0_f64; outgoing];
+		for (slot, &vanilla_slot) in order.iter().enumerate() {
+			if slot >= weights.len() || vanilla_slot >= steering.len() {
+				continue;
 			}
-			bytes.push(byte);
+			steering[vanilla_slot] = weights[slot];
 		}
-		Some(String::from_utf8_lossy(&bytes).into_owned())
-	}
-
-	/// The route vector. An empty vector is legal and common: vanilla end
-	/// nodes have no outgoing routes at all (`begin == end`, both null in
-	/// a default-constructed MSVC vector).
-	fn routes(&self, def: usize) -> Option<(usize, usize)> {
-		let begin = self.read_qword(def + layout::def::ROUTES)? as usize;
-		let end = self.read_qword(def + layout::def::ROUTES_END)? as usize;
-		if begin == end {
-			return Some((begin, end));
-		}
-		if begin == 0 || end < begin || !(end - begin).is_multiple_of(layout::route::SIZE) {
-			return None;
-		}
-		Some((begin, end))
+		steering
 	}
 }
 
@@ -573,30 +457,20 @@ impl EngineBackend for LiveBackend {
 		"live EU4 1.37.5 trade database"
 	}
 
-	fn set_source(&mut self, context: usize, db: usize) {
+	fn set_source(&mut self, context: usize, _db: usize) {
 		self.context = context;
-		self.db = db;
+		self.exe_base = EXE_BASE.load(Ordering::Acquire);
 	}
 
 	fn observe(&mut self) -> Result<Vec<NodeSnapshot>, &'static str> {
-		if self.db == 0 {
+		if self.context == 0 {
 			return Err("no database yet");
 		}
 		let count = self.node_count().ok_or("implausible node count")?;
-		self.nodes_base().ok_or("implausible node array")?;
+		let game = self.game().ok_or("no database yet")?;
+		let nodes = game.trade_nodes().ok_or("implausible node count")?;
 		for index in 0..count {
-			let node = self.node_at(index).ok_or("implausible node pointer")?;
-			self.definition_of(node)
-				.ok_or("implausible definition pointer")?;
-		}
-		// Definition pointer to engine index: a route entry's target is
-		// the destination node's *definition* pointer (the live dump
-		// showed entry+0x30 inside the definition heap range).
-		let mut index_by_def: HashMap<usize, u32> = HashMap::with_capacity(count);
-		for index in 0..count {
-			let node = self.node_at(index).expect("validated above");
-			let def = self.definition_of(node).expect("validated above");
-			index_by_def.insert(def, index as u32);
+			nodes.node(index).ok_or("implausible node pointer")?;
 		}
 		self.names.clear();
 		// The vanilla outgoing edges, captured at the first observe (which
@@ -606,41 +480,36 @@ impl EngineBackend for LiveBackend {
 		// mirror. The live vector is still counted below as a diagnostic.
 		if self.vanilla_outgoing.is_empty() {
 			for index in 0..count {
-				let node = self.node_at(index).expect("validated above");
-				let def = self.definition_of(node).expect("validated above");
-				let Some((begin, end)) = self.routes(def) else {
-					return Err("implausible route vector");
-				};
-				let outgoing: Vec<u32> = (begin..end)
-					.step_by(layout::route::SIZE)
-					.filter_map(|slot| {
-						let target = self.read_qword(slot + layout::route::TARGET)? as usize;
-						index_by_def.get(&target).copied()
-					})
-					.collect();
-				self.vanilla_outgoing.insert(index as u32, outgoing);
+				let view = nodes.node(index).expect("validated above");
+				let outgoing = view
+					.outgoing_targets(&nodes)
+					.ok_or("implausible route vector")?;
+				self.vanilla_outgoing.insert(
+					index as u32,
+					outgoing.into_iter().map(|target| target as u32).collect(),
+				);
 			}
 		}
-		let mut nodes = Vec::with_capacity(count);
+		let mut snapshots = Vec::with_capacity(count);
 		for index in 0..count {
-			let node = self.node_at(index).expect("validated above");
-			let def = self.definition_of(node).expect("validated above");
+			let view = nodes.node(index).expect("validated above");
 			self.names
-				.push((def, self.read_name(def).unwrap_or_default()));
+				.push((view.definition, view.name().unwrap_or_default()));
 			let outgoing = self
 				.vanilla_outgoing
 				.get(&(index as u32))
 				.cloned()
 				.unwrap_or_default();
-			let Some((begin, end)) = self.routes(def) else {
-				return Err("implausible route vector");
-			};
-			let route_count = (end - begin) / layout::route::SIZE;
+			let route_count = view
+				.live_route_count(&nodes)
+				.ok_or("implausible route vector")?;
 			// After mutations the live vector holds exactly the open
 			// entries; a drift from the plugin's own closed flags would
 			// mean an external writer touched the topology.
 			if let Some(state) = self.mutations.get(&(index as u32)) {
-				let expected = state.closed.iter().filter(|c| !**c).count();
+				let expected = (0..state.edges)
+					.filter(|edge| !state.mutation.is_closed(*edge))
+					.count();
 				if route_count != expected {
 					crate::logging::write(
 						crate::logging::WARN,
@@ -654,110 +523,55 @@ impl EngineBackend for LiveBackend {
 			// entry for entry, but that pairing is a spike hypothesis, not
 			// a pinned fact: log the first mismatch as a diagnostic and
 			// keep observing, so a live session tells us the real shape.
-			let weights = self
-				.read_qword(node + layout::node::WEIGHTS)
-				.ok_or("implausible weights vector")? as usize;
-			let weights_end = self
-				.read_qword(node + layout::node::WEIGHTS + 8)
-				.ok_or("implausible weights vector")? as usize;
-			if !self.pairing_logged
-				&& (weights_end < weights || (weights_end - weights) / 4 != route_count)
-			{
+			let weights = view.steering();
+			if !self.pairing_logged && weights.len() != route_count {
 				self.pairing_logged = true;
 				crate::logging::write(
 					crate::logging::DEBUG,
 					&format!(
 						"weights pairing differs on node {index}: {} weight slots vs {route_count} routes",
-						weights_end.saturating_sub(weights) / 4
+						weights.len()
 					),
 				);
 			}
-			// The index fields are spike hypotheses, so the first observe
-			// logs them as diagnostics instead of trusting them; the node
-			// names are the real proof the definitions were reversed right.
+			// Names are the proof the definitions were read. The first
+			// observe logs a few of them with the live route count.
 			if !self.fields_logged {
 				self.fields_logged = true;
 				for probe in 0..count.min(3) {
-					let node = self.node_at(probe).expect("validated above");
-					let def = self.definition_of(node).expect("validated above");
-					let routes_begin = self.read_qword(def + layout::def::ROUTES);
-					let routes_end = self.read_qword(def + layout::def::ROUTES_END);
-					let routes_cap = self.read_qword(def + layout::def::ROUTES_END + 8);
-					let name_bytes = (0..16)
-						.filter_map(|i| self.read_i32(def + layout::def::NAME + i))
-						.map(|v| v as u8)
-						.take_while(|b| *b != 0)
-						.collect::<Vec<u8>>();
-					let name = String::from_utf8_lossy(&name_bytes);
+					let probed = nodes.node(probe).expect("validated above");
+					let name = probed.name().unwrap_or_default();
 					crate::logging::write(
 						crate::logging::DEBUG,
 						&format!(
-							"node {probe}: ptr 0x{node:x}, def 0x{def:x}, routes {routes_begin:?}..{routes_end:?} cap {routes_cap:?}, inline name {name:?}"
+							"node {probe}: ptr 0x{:x}, def 0x{:x}, live routes {:?}, name {name:?}",
+							probed.raw_address(),
+							probed.definition,
+							probed.live_route_count(&nodes),
 						),
 					);
 				}
 			}
-			// Engine-cached aggregates, all in thousandths: goods produced
-			// as the production-side wealth input, total trade power, and
-			// the current value. A per-node tax aggregate does not exist
-			// in the trade node object; tax stays zero until the province
-			// walk lands (see the README's known limits).
-			// Steering: the engine's per-edge effort vector, read from
-			// the live node (merchants, investments, light ships).
-			// Steering, restored to vanilla edge order: after a mutation
-			// the live slots hold the open-first permutation, so slot i
-			// carries vanilla edge live_order(closed)[i]. Invert the
-			// permutation before pairing the weights with the vanilla
-			// outgoing list.
-			let mut steering = vec![0.0_f64; outgoing.len()];
-			if let Some(begin) = self
-				.read_qword(node + layout::node::WEIGHTS)
-				.map(|p| p as usize)
-			{
-				let end = self
-					.read_qword(node + layout::node::WEIGHTS + 8)
-					.map(|p| p as usize)
-					.unwrap_or(begin);
-				let live_count = end.saturating_sub(begin) / 4;
-				let order = self
-					.mutations
-					.get(&(index as u32))
-					.map(|state| live_order(&state.closed))
-					.unwrap_or_else(|| (0..outgoing.len()).collect::<Vec<_>>());
-				for (slot, &vanilla_slot) in order.iter().enumerate() {
-					if slot >= live_count || vanilla_slot >= steering.len() {
-						continue;
-					}
-					if let Some(value) = self.read_i32(begin + slot * 4) {
-						steering[vanilla_slot] = value as f64;
-					}
-				}
-			}
-			// The engine's own retention rate: retained / (retained +
-			// transferred), from the live node after the monthly update.
-			// This is what the game's mechanics (trade power shares,
-			// merchant modes) actually compute — no artificial formula.
-			let retained_value = self.read_i32(node + layout::node::VALUE).unwrap_or(0) as f64;
-			let transferred = self.read_i32(node + layout::node::TRANSFERRED).unwrap_or(0) as f64;
+			let retained_value = view.value().unwrap_or(0) as f64;
+			let transferred = view.transferred().unwrap_or(0) as f64;
 			let retention = if retained_value + transferred > 0.0 {
 				retained_value / (retained_value + transferred)
 			} else {
 				0.0
 			};
-			nodes.push(NodeSnapshot {
+			let steering = self.vanilla_steering(index as u32, outgoing.len(), &weights);
+			snapshots.push(NodeSnapshot {
 				id: index as u32,
 				tax: self.node_tax.get(&(index as u32)).copied().unwrap_or(0.0),
 				retention,
-				production: self.read_i32(node + layout::node::LOCAL_VALUE).unwrap_or(0) as f64,
-				trade_power: self.read_i32(node + layout::node::POWER).unwrap_or(0) as f64,
+				production: view.local_value().unwrap_or(0) as f64,
+				trade_power: view.power().unwrap_or(0) as f64,
 				current_value: retained_value,
 				outgoing,
 				steering,
 			});
 		}
-		// M2 semantics survey, once, after every name is collected:
-		// per-node engine-cached candidates across a dozen nodes, to
-		// tell trade power from tax-like aggregates by correlation.
+		// M2 semantics survey, once, after every name is collected.
 		if !self.entry_logged {
 			self.entry_logged = true;
 			let edges: Vec<String> = self
@@ -775,17 +589,16 @@ impl EngineBackend for LiveBackend {
 			);
 			let mut lines = Vec::new();
 			for probe in 0..count {
-				let Some(probe_node) = self.node_at(probe) else {
+				let Some(probed) = nodes.node(probe) else {
 					continue;
 				};
-				let value = self.read_i32(probe_node + layout::node::VALUE);
-				let c8 = self.read_i32(probe_node + 0xc8);
-				let d0 = self.read_i32(probe_node + 0xd0);
-				let d8 = self.read_i32(probe_node + 0xd8);
-				let e4 = self.read_i32(probe_node + 0xe4);
 				lines.push(format!(
-					"{}: value {value:?} c8 {c8:?} d0 {d0:?} d8 {d8:?} e4 {e4:?}",
-					self.names[probe].1
+					"{}: value {:?} local {:?} transferred {:?} power {:?}",
+					self.names[probe].1,
+					probed.value(),
+					probed.local_value(),
+					probed.transferred(),
+					probed.power(),
 				));
 			}
 			crate::logging::write(
@@ -793,14 +606,6 @@ impl EngineBackend for LiveBackend {
 				&format!("node field survey:\n  {}", lines.join("\n  ")),
 			);
 		}
-		// Province-memory survey, deferred past the load phase (the first
-		// observe fires during Late History, when the province pointer
-		// table is not yet safe to walk). Sample entries of the province
-		// table shared by all nodes (node+0x18, 0xc0 stride): each entry
-		// carries its province id (entry+0x10 high half) and, by the
-		// spike's reading, its node index at entry+0xa8. The first
-		// 0x400 bytes of each province object are dumped as hex words to
-		// correlate against the history files' base_tax offline.
 		// Taxes need the province array, which is only safe after the
 		// load phase; retry until it lands.
 		self.aggregate_taxes(count);
@@ -815,7 +620,7 @@ impl EngineBackend for LiveBackend {
 		// the first one could not (the update can fire mid-load).
 		self.observes += 1;
 		if self.observes == 1 || self.observes.is_multiple_of(100) {
-			let edges: usize = nodes.iter().map(|n| n.outgoing.len()).sum();
+			let edges: usize = snapshots.iter().map(|n| n.outgoing.len()).sum();
 			let sample: Vec<&str> = self
 				.names
 				.iter()
@@ -828,13 +633,13 @@ impl EngineBackend for LiveBackend {
 				&format!(
 					"observe #{}: {} nodes, {} edges, names [{}]",
 					self.observes,
-					nodes.len(),
+					snapshots.len(),
 					edges,
 					sample.join(", ")
 				),
 			);
 		}
-		Ok(nodes)
+		Ok(snapshots)
 	}
 
 	fn node_index(&self, name: &str) -> Option<u32> {
@@ -844,83 +649,39 @@ impl EngineBackend for LiveBackend {
 			.map(|i| i as u32)
 	}
 
-	/// The countries holding trade power in one node: every country
-	/// index whose entry in the node's per-country table carries power.
+	/// The countries holding trade power in one node: every registry
+	/// country whose entry power reads above zero.
 	fn node_participants(&mut self, node: u32) -> Vec<(u32, f64)> {
-		let Some(node_ptr) = self.node_at(node as usize) else {
+		let Some(game) = self.game() else {
 			return Vec::new();
 		};
-		let Some(table) = self
-			.read_qword(node_ptr + layout::node::ENTRY_TABLE)
-			.map(|p| p as usize)
-			.filter(|p| *p > 0x1_0000)
-		else {
+		let Some(nodes) = game.trade_nodes() else {
 			return Vec::new();
 		};
-		let count = self.country_count().unwrap_or(0);
-		if count == 0 || count > 1024 {
+		let Some(countries) = game.countries() else {
 			return Vec::new();
-		}
-		let mut participants = Vec::new();
-		for index in 0..count {
-			let entry = table + index * layout::node::ENTRY_SIZE;
-			match self.read_i32(entry + layout::entry::POWER) {
-				Some(power) if power > 0 => {
-					participants.push((index as u32, power as f64));
-				}
-				_ => {}
-			}
-		}
-		participants
+		};
+		let Some(view) = nodes.node(node as usize) else {
+			return Vec::new();
+		};
+		view.participants(&countries)
+			.into_iter()
+			.filter(|(_, power)| *power > 0)
+			.map(|(index, power)| (index as u32, power as f64))
+			.collect()
 	}
 
-	/// Add to one country's treasury, mirroring `CCountry::ChangeTreasury`:
-	/// the field add with the ±1e9 clamp and the player-UI dirty bit.
+	/// Add to one country's treasury, mirroring `CCountry::ChangeTreasury`
+	/// through [`Eu4Game::pay_country`] (the ±1e9 clamp and the player-UI
+	/// dirty bit).
 	fn pay_country(&mut self, country: u32, amount: f64) -> Result<(), &'static str> {
-		let base = EXE_BASE.load(Ordering::Acquire);
-		if base <= 0x1_0000 {
-			return Err("no exe base");
-		}
-		let manager = self
-			.read_qword(base + layout::COUNTRY_MANAGER_GLOBAL_RVA)
-			.map(|p| p as usize)
-			.filter(|p| *p > 0x1_0000)
-			.ok_or("implausible country manager")?;
-		let pointers = self
-			.read_qword(manager + layout::country_manager::INDEX_ARRAY)
-			.map(|p| p as usize)
-			.filter(|p| *p > 0x1_0000)
-			.ok_or("implausible country array")?;
-		let country_ptr = self
-			.read_qword(pointers + country as usize * 8)
-			.map(|p| p as usize)
-			.filter(|p| *p > 0x1_0000)
-			.ok_or("implausible country pointer")?;
-		let treasury = self
-			.read_i32(country_ptr + layout::country::TREASURY)
-			.ok_or("treasury unreadable")? as i64;
-		// The amounts arrive as engine thousandths; the treasury field's
-		// own unit is the same thousandths-of-a-ducat scale the trade
-		// values use, so the add is direct.
-		let updated = (treasury + amount.round() as i64).clamp(
-			-layout::country::TREASURY_CLAMP,
-			layout::country::TREASURY_CLAMP,
-		);
-		self.write_i32(country_ptr + layout::country::TREASURY, updated as i32)
-			.ok_or("treasury write refused")?;
-		// Refresh the player's treasury label, as ChangeTreasury does.
-		if let Some(controller) = self
-			.read_qword(self.context + layout::ui::CONTROLLER)
-			.map(|p| p as usize)
-			.filter(|p| *p > 0x1_0000)
-			&& let Some(flags) = self.read_i32(controller + layout::ui::FLAGS)
-		{
-			let _ = self.write_i32(
-				controller + layout::ui::FLAGS,
-				flags | layout::ui::TREASURY_DIRTY,
-			);
-		}
-		Ok(())
+		let game = self.game().ok_or("no exe base")?;
+		let thousandths = amount.round() as i64;
+		// SAFETY: the monthly detour runs on the game thread. `pay_country`
+		// resolves the country through this view's registry and writes that
+		// country's treasury, plus the UI dirty bit when a controller is
+		// present. `from_tick` already matched `context` to the global.
+		unsafe { game.pay_country(country as usize, thousandths) }.ok_or("treasury write refused")
 	}
 
 	fn set_edge_closed(
@@ -930,20 +691,30 @@ impl EngineBackend for LiveBackend {
 		closed: bool,
 	) -> Result<(), &'static str> {
 		self.capture(node)?;
-		let Some(state) = self.mutations.get_mut(&node) else {
-			return Ok(());
-		};
-		if edge >= state.closed.len() {
+		let edges = self
+			.mutations
+			.get(&node)
+			.map(|state| state.edges)
+			.ok_or("implausible route vector")?;
+		if edge >= edges {
 			return Err("edge slot beyond the vanilla set");
 		}
-		state.closed[edge] = closed;
-		self.apply(node)
+		let memory = self.game().ok_or("no exe base")?.memory;
+		let state = self
+			.mutations
+			.get_mut(&node)
+			.ok_or("implausible route vector")?;
+		// SAFETY: the monthly detour runs on the game thread. `capture`
+		// recorded the engine's own route and steering arrays, and
+		// `set_closed` writes only inside that captured capacity. No Rust
+		// reference aliases those arrays.
+		unsafe { state.mutation.set_closed(&memory, edge, closed) }.ok_or("route write refused")
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{LiveBackend, live_order, parse_members};
+	use super::{MemberSource, member_source_summary, parse_members, resolve_members};
 
 	#[test]
 	fn members_parse_into_keys_and_province_ids() {
@@ -979,73 +750,177 @@ only-a-key"
 		);
 	}
 
-	/// Build a fake in-process object so the pointer-walking readers can be
-	/// tested against real (aligned, plausible) addresses.
-	fn scratch(qwords: usize) -> (Vec<u64>, usize) {
-		let mut buffer = vec![0_u64; qwords];
-		let address = buffer.as_mut_ptr() as usize;
-		buffer[0] = address as u64; // self-pointer handy for SSO data
-		(buffer, address)
+	#[test]
+	fn live_member_vector_beats_the_static_table() {
+		let static_ids = [9, 10];
+		let (source, ids) = resolve_members(Some(&[1, 2]), Some(&static_ids)).unwrap();
+		assert_eq!(source, MemberSource::LiveVector);
+		assert_eq!(ids, vec![1, 2]);
+		let (source, ids) = resolve_members(Some(&[1]), None).unwrap();
+		assert_eq!(source, MemberSource::LiveVector);
+		assert_eq!(ids, vec![1]);
 	}
 
 	#[test]
-	fn sso_keys_read_inline_and_pointer_forms() {
-		let backend = LiveBackend::new();
-		// Inline: capacity <= 0xF keeps the bytes inside the object.
-		let (mut buffer, address) = scratch(6);
-		buffer[0] = u64::from_le_bytes(*b"zanzibar");
-		buffer[1] = 0;
-		buffer[2] = 8; // length at +0x10
-		buffer[3] = 0xF; // capacity at +0x18
-		assert_eq!(backend.read_sso_key(address).as_deref(), Some("zanzibar"));
-		// Pointer: capacity > 0xF dereferences the first qword, here
-		// aimed at the key bytes living later in the same allocation.
-		let (mut buffer, address) = scratch(6);
-		let data = address + 8 * 5;
-		buffer[0] = data as u64;
-		buffer[2] = 4;
-		buffer[3] = 0x1F;
-		buffer[5] = u64::from_le_bytes(*b"siamxxxx");
-		assert_eq!(backend.read_sso_key(address).as_deref(), Some("siam"));
+	fn empty_or_missing_live_vector_falls_back_to_node_members() {
+		let static_ids = [12, 13];
+		let missing_or_empty: [Option<&[u32]>; 2] = [None, Some(&[])];
+		for live in missing_or_empty {
+			let (source, ids) = resolve_members(live, Some(&static_ids)).unwrap();
+			assert_eq!(source, MemberSource::StaticTable);
+			assert_eq!(ids, vec![12, 13]);
+		}
+		assert_eq!(resolve_members(None, None), None);
+		assert_eq!(resolve_members(Some(&[]), Some(&[])), None);
+		assert_eq!(resolve_members(Some(&[]), None), None);
 	}
 
 	#[test]
-	fn sso_keys_reject_implausible_lengths_and_charset() {
-		let backend = LiveBackend::new();
-		let (mut buffer, address) = scratch(6);
-		buffer[2] = 65; // length beyond the documented key range
-		buffer[3] = 0xF;
-		assert_eq!(backend.read_sso_key(address), None);
-		buffer[2] = 4;
-		buffer[0] = u64::from_le_bytes([b'U', b'P', b'P', b'E', 0, 0, 0, 0]);
-		// Uppercase is not the internal-key charset.
-		assert_eq!(backend.read_sso_key(address), None);
+	fn member_source_log_names_which_table_won() {
+		let text = member_source_summary(2, 3, 1, 1);
+		assert!(text.contains("2/3"));
+		assert!(text.contains("1 live vector"));
+		assert!(text.contains("1 static node_members.txt"));
+		assert!(text.contains("pending live verification"));
+		assert!(!text.contains("0x"));
+	}
+
+	#[cfg(windows)]
+	use super::LiveBackend;
+	#[cfg(windows)]
+	use crate::config::SinkBasis;
+	#[cfg(windows)]
+	use foch_runtime::dataplane::testing::FakeGame;
+
+	/// Bind a sealed scene. The returned game's buffers stay alive only as
+	/// long as `scene` does; callers keep `scene` until the reads finish.
+	#[cfg(windows)]
+	fn bind(scene: &mut FakeGame, members: Vec<(String, Vec<u32>)>) -> LiveBackend {
+		let game = scene.game().expect("synthetic scene");
+		let mut backend = LiveBackend::with_members(members, SinkBasis::Mean);
+		backend.context = game.context;
+		backend.exe_base = game.exe_base;
+		backend
+	}
+
+	#[cfg(windows)]
+	fn scene_with_nodes(count: usize) -> FakeGame {
+		let mut scene = FakeGame::new();
+		for _ in 0..count {
+			scene.add_trade_node(&[], &[]).expect("node");
+		}
+		scene
 	}
 
 	#[test]
-	fn tags_unpack_from_the_identity_qword() {
-		let backend = LiveBackend::new();
-		let (mut buffer, address) = scratch(8);
-		// tag in the low bytes, country index in bits 32..48.
-		buffer[4] = u64::from_le_bytes([b'S', b'W', b'E', 0, 4, 0, 0, 0]);
-		assert_eq!(backend.read_tag(address), "SWE");
-		// An implausible address falls back to the question mark rather
-		// than panicking.
-		assert_eq!(backend.read_tag(0), "?");
+	#[cfg(windows)]
+	fn node_count_accepts_regional_and_overhaul_maps() {
+		// The retired gate was `20..=512`. Shared `Eu4Game::trade_nodes`
+		// accepts `1..=MAX_TRADE_NODES`; country counts use `1..=i16::MAX`.
+		let ceiling = foch_runtime::dataplane::game::MAX_TRADE_NODES;
+		for count in [1usize, 5, 19, 20, 512, 513, 1024, ceiling] {
+			let mut scene = scene_with_nodes(count);
+			let backend = bind(&mut scene, Vec::new());
+			assert_eq!(backend.node_count(), Some(count), "count {count}");
+			std::hint::black_box(&scene);
+		}
+
+		let mut empty = FakeGame::new();
+		let backend = bind(&mut empty, Vec::new());
+		assert_eq!(backend.node_count(), None);
+		assert_eq!(backend.country_count(), None);
+		std::hint::black_box(&empty);
+
+		let mut wide = FakeGame::new();
+		wide.add_country("FRA", 1499, 0, None, &[])
+			.expect("country");
+		let backend = bind(&mut wide, Vec::new());
+		assert_eq!(backend.country_count(), Some(1500));
+		std::hint::black_box(&wide);
+
+		let mut at_cap = FakeGame::new();
+		at_cap
+			.add_country("FRA", (i16::MAX as u16) - 1, 0, None, &[])
+			.expect("country");
+		let backend = bind(&mut at_cap, Vec::new());
+		assert_eq!(backend.country_count(), Some(i16::MAX as usize));
+		std::hint::black_box(&at_cap);
+	}
+
+	/// Write the internal key of node 0's first outgoing route. The scene
+	/// must already contain that route, and must stay alive across the write.
+	///
+	/// `ROUTE_TARGET_KEY` is `route.target_key` on the compiled-in 1.37.5
+	/// profile. Production reads that field through
+	/// [`NodeView::route_target_key`]; the profile keeps the offset private,
+	/// so only this plant names it. The following two stores are the MSVC
+	/// inline-string length and capacity, not a trade-route field.
+	#[cfg(windows)]
+	fn plant_route_key(scene: &mut FakeGame, key: &str) {
+		const ROUTE_TARGET_KEY: usize = 0x10;
+		const SSO_LENGTH: usize = 0x10;
+		const SSO_CAPACITY: usize = 0x18;
+		let game = scene.game().expect("scene");
+		let nodes = game.trade_nodes().expect("nodes");
+		let view = nodes.node(0).expect("node");
+		let (begin, end) = nodes.routes(view.definition).expect("routes");
+		let count = view.live_route_count(&nodes).expect("route count");
+		assert!(count >= 1, "the key lives on an outgoing route");
+		let slot = begin;
+		let stride = (end - begin) / count;
+		assert!(stride > ROUTE_TARGET_KEY);
+		let key_at = slot + ROUTE_TARGET_KEY;
+		let memory = game.memory;
+		// SAFETY: `scene` owns the route allocation for this call, and the
+		// test is the only writer. The bytes are the inline SSO
+		// `NodeView::route_target_key` reads back.
+		unsafe {
+			memory
+				.write_bytes(key_at, key.as_bytes())
+				.expect("key bytes");
+			memory
+				.write_qword(key_at + SSO_LENGTH, key.len() as u64)
+				.expect("key length");
+			memory
+				.write_qword(key_at + SSO_CAPACITY, 0xF)
+				.expect("key capacity");
+		}
+		assert_eq!(view.route_target_key(slot).as_deref(), Some(key));
+	}
+
+	#[cfg(windows)]
+	fn tax_scene(members: &[u32], with_route: bool) -> FakeGame {
+		let mut scene = FakeGame::new();
+		scene.add_province(1, 3_000, 0).expect("province");
+		scene.add_province(2, 9_000, 0).expect("province");
+		let routes: &[usize] = if with_route { &[0] } else { &[] };
+		scene.add_trade_node(routes, members).expect("node");
+		scene
 	}
 
 	#[test]
-	fn open_entries_stay_first_in_vanilla_order() {
-		assert_eq!(live_order(&[false, false]), vec![0, 1]);
-		// Closing the middle of three parks vanilla slot 1 at the tail.
-		assert_eq!(live_order(&[false, true, false]), vec![0, 2, 1]);
-		// Closed slots keep their vanilla order at the tail.
-		assert_eq!(live_order(&[true, true]), vec![0, 1]);
-		assert_eq!(live_order(&[true, false, true]), vec![1, 0, 2]);
+	#[cfg(windows)]
+	fn aggregate_taxes_prefers_the_live_member_vector() {
+		let mut scene = tax_scene(&[1], false);
+		let mut backend = bind(&mut scene, vec![("malacca".to_string(), vec![2])]);
+		backend.aggregate_taxes(1);
+		assert_eq!(backend.node_tax.get(&0).copied(), Some(3_000.0));
+		std::hint::black_box(&scene);
 	}
 
 	#[test]
-	fn an_empty_node_has_an_empty_order() {
-		assert!(live_order(&[]).is_empty());
+	#[cfg(windows)]
+	fn aggregate_taxes_falls_back_when_the_live_vector_is_empty() {
+		let mut scene = tax_scene(&[], true);
+		plant_route_key(&mut scene, "malacca");
+		let mut backend = bind(&mut scene, vec![("malacca".to_string(), vec![2])]);
+		backend.aggregate_taxes(1);
+		assert_eq!(backend.node_tax.get(&0).copied(), Some(9_000.0));
+
+		let mut bare = tax_scene(&[], false);
+		let mut backend = bind(&mut bare, Vec::new());
+		backend.aggregate_taxes(1);
+		assert!(backend.node_tax.is_empty());
+		std::hint::black_box((&scene, &bare));
 	}
 }

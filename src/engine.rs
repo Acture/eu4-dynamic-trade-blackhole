@@ -58,6 +58,11 @@ pub struct Engine<B: EngineBackend, F: Fn(i32, &str)> {
 	/// Ticks seen; each one is one monthly-cadence step of the hook.
 	ticks: u32,
 	force_closed: bool,
+	/// Last month's world entrepot, for crown-change gazette lines.
+	world_entrepot: Option<u32>,
+	/// Rolling entrepot scores for the 12-month moving average: the
+	/// latest twelve (tick, score) samples, oldest evicted first.
+	score_window: std::collections::VecDeque<(u32, f64)>,
 	log: F,
 }
 
@@ -70,6 +75,8 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 			evidence: None,
 			ticks: 0,
 			force_closed: false,
+			world_entrepot: None,
+			score_window: Default::default(),
 			log,
 		}
 	}
@@ -247,6 +254,17 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 					logging::INFO,
 					&format!("tick {}: {}", self.ticks, flip.describe(nodes)),
 				);
+				(self.log)(
+					logging::INFO,
+					&crate::receipt::flip(
+						if want_closed { "close" } else { "reopen" },
+						flip.node,
+						nodes[flip.node as usize].outgoing[flip.edge],
+						self.ticks,
+						flip.net_flow.round() as i64,
+						flip.pool.round() as i64,
+					),
+				);
 			}
 		}
 		// Transit intelligence: which corridors carry the most flow and
@@ -255,6 +273,40 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 		// invest for maximum carriage return.
 		for line in policy::transit_intelligence(nodes, self.closed.as_ref().unwrap(), &params) {
 			(self.log)(logging::INFO, &line);
+		}
+		// The monthly gazette: entrepot tiers from the ranking, with
+		// crown-change lines when the world entrepot moves. Pure
+		// information (design.md P0); the fee surcharge is not in it.
+		let ranking = policy::entrepot_ranking(nodes);
+		for line in policy::gazette(&ranking, self.world_entrepot) {
+			(self.log)(logging::INFO, &line);
+		}
+		if let Some((node, score)) = ranking.first() {
+			// 12-month moving average of the leader's score: single-month
+			// spikes cannot move the crown on their own (design.md P0).
+			self.score_window.push_back((self.ticks, *score));
+			while self.score_window.len() > 12 {
+				self.score_window.pop_front();
+			}
+			let average = self.score_window.iter().map(|(_, s)| s).sum::<f64>()
+				/ self.score_window.len() as f64;
+			(self.log)(
+				logging::INFO,
+				&format!(
+					"gazette: world entrepot {node} 12-month average {average:.0} over {} months",
+					self.score_window.len()
+				),
+			);
+			(self.log)(
+				logging::INFO,
+				&crate::receipt::gazette(
+					self.ticks,
+					*node,
+					self.world_entrepot,
+					average.round() as i64,
+				),
+			);
+			self.world_entrepot = Some(*node);
 		}
 		// Reopen diagnostics: every closed edge's net flow against the
 		// threshold band, so a stuck reopen is visible month by month.
@@ -316,6 +368,17 @@ impl<B: EngineBackend, F: Fn(i32, &str)> Engine<B, F> {
 						pool.volume,
 						pool.pool,
 						paid.join(", ")
+					),
+				);
+				(self.log)(
+					logging::INFO,
+					&crate::receipt::fees(
+						pool.kind.label(),
+						pool.node,
+						self.ticks,
+						pool.volume.round() as i64,
+						pool.pool.round() as i64,
+						paid.len(),
 					),
 				);
 			}
@@ -716,6 +779,133 @@ mod tests {
 		);
 		engine.tick();
 		assert!(state.borrow().payments.is_empty());
+	}
+
+	#[test]
+	fn the_gazette_crowns_and_tracks_the_world_entrepot() {
+		let state = inner();
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes = vec![
+				NodeSnapshot {
+					id: 0,
+					tax: 1000.0,
+					retention: 0.1,
+					production: 8000.0,
+					trade_power: 100.0,
+					current_value: 9000.0,
+					outgoing: vec![1],
+					steering: vec![0.0],
+				},
+				NodeSnapshot {
+					id: 1,
+					tax: 1000.0,
+					retention: 0.1,
+					production: 0.0,
+					trade_power: 5000.0,
+					current_value: 20000.0,
+					outgoing: vec![],
+					steering: vec![],
+				},
+			];
+		}
+		let logs = RefCell::new(Vec::new());
+		let mut engine = make(
+			Config {
+				mode: Mode::Policy,
+				..Config::default()
+			},
+			&state,
+			&logs,
+		);
+		engine.tick();
+		let first = logs.borrow().join(
+			"
+",
+		);
+		assert!(
+			first.contains("world entrepot crowned: 1"),
+			"gazette: {first}"
+		);
+		// Dethrone: node 0 becomes both the bigger pool and the bigger
+		// power next month, so its score overtakes node 1's.
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes[0].current_value = 50000.0;
+			inner.nodes[0].trade_power = 9000.0;
+			inner.nodes[1].current_value = 20000.0;
+		}
+		engine.tick();
+		let second = logs.borrow().join(
+			"
+",
+		);
+		assert!(
+			second.contains("dethrones 1"),
+			"crown change logged: {second}"
+		);
+	}
+
+	#[test]
+	fn decisions_emit_structured_receipts() {
+		let state = inner();
+		{
+			let mut inner = state.borrow_mut();
+			inner.nodes = vec![
+				NodeSnapshot {
+					id: 0,
+					tax: 5000.0,
+					retention: 0.98,
+					production: 8000.0,
+					trade_power: 100.0,
+					current_value: 8000.0,
+					outgoing: vec![1],
+					steering: vec![0.0],
+				},
+				NodeSnapshot {
+					id: 1,
+					tax: 500.0,
+					retention: 0.1,
+					production: 0.0,
+					trade_power: 100.0,
+					current_value: 0.0,
+					outgoing: vec![],
+					steering: vec![],
+				},
+			];
+			inner.participants = vec![(0, vec![(7, 100.0)])];
+		}
+		let logs = RefCell::new(Vec::new());
+		let mut engine = make(
+			Config {
+				mode: Mode::Policy,
+				evidence_months: 1,
+				..Config::default()
+			},
+			&state,
+			&logs,
+		);
+		engine.tick();
+		let messages = logs.borrow().join(
+			"
+",
+		);
+		// The flip receipt carries the decision as judge-parseable JSON.
+		assert!(messages.contains("FOCH_RECEIPT/1"), "receipts: {messages}");
+		assert!(
+			messages.contains(r#""type":"edge_flip""#),
+			"flip receipt: {messages}"
+		);
+		assert!(
+			messages.contains(r#""type":"gazette""#),
+			"gazette receipt: {messages}"
+		);
+		// Participants exist, so a fee receipt for the source bounty
+		// (the sink-hub ranking leader) is present too.
+		assert!(
+			messages.contains(r#""type":"role_fees""#),
+			"fee receipt: {messages}"
+		);
 	}
 
 	#[test]

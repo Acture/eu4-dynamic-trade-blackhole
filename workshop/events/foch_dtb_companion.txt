@@ -1,0 +1,13 @@
+namespace = foch_dtb_info
+
+country_event = {
+	id = foch_dtb_info.1
+	title = foch_dtb_info.1.t
+	desc = foch_dtb_info.1.d
+	picture = BIG_BOOK_eventPicture
+	is_triggered_only = yes
+
+	option = {
+		name = foch_dtb_info.1.a
+	}
+}

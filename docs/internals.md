@@ -67,10 +67,10 @@ recovery simple. The vanilla outgoing list the policy plans against is
 frozen at the first observe, so live reordering never disturbs vanilla
 slot indices.
 
-Live-confirmed invariants the backend re-checks every observe: node
-count within 20..=512, every node/definition pointer plausible, route
-vector strides exact, SSO names readable, and the exe digest verified
-before any pattern runs.
+Invariants the backend re-checks every observe: node count within
+`1..=MAX_TRADE_NODES` (4096, the shared dataplane gate), every
+node/definition pointer plausible, route vector strides exact, SSO names
+readable, and the exe digest verified before any pattern runs.
 
 ## Design history (what was tried and replaced)
 

@@ -1,13 +1,18 @@
-"""Assemble the trade-blackhole plugin package under target/plugin-pkg.
+"""Assemble the trade-blackhole plugin package.
 
 Copies the release DLL and the offline node-members table next to a fresh
 foch-plugin.toml and fills the [[files]] sha256 digests, so
 `foch plugin import` gets a self-contained native package. Run after
 `cargo build -p foch-plugin-trade-blackhole --release --locked`.
+
+The default directory is `<workspace>/target/plugin-pkg`. Pass `--out` to
+write a fresh package somewhere else (the offline player-chain check uses
+`target/e2e-pkg/trade-blackhole`).
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import shutil
 from pathlib import Path
@@ -23,7 +28,7 @@ REPO = next(
     ),
     PACKAGE.parent.parent,
 )
-PKG = REPO / "target/plugin-pkg"
+DEFAULT_PKG = REPO / "target/plugin-pkg"
 DLL = REPO / "target/release/foch_plugin_trade_blackhole.dll"
 MEMBERS = PACKAGE / "tools/node_members.txt"
 NAME = "trade_blackhole.dll"
@@ -32,6 +37,7 @@ MANIFEST = """\
 schema = 1
 
 [plugin]
+id = "dev.foch.eu4-dynamic-trade-blackhole"
 name = "eu4-dynamic-trade-blackhole"
 repository = "https://github.com/Acture/eu4-dynamic-trade-blackhole"
 version = "0.0.1"
@@ -147,26 +153,35 @@ def digest_of(path: Path) -> str:
 
 
 def main() -> None:
+	parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+	parser.add_argument(
+		"--out",
+		type=Path,
+		default=DEFAULT_PKG,
+		help="package directory (default: <workspace>/target/plugin-pkg)",
+	)
+	args = parser.parse_args()
+	pkg = args.out if args.out.is_absolute() else (Path.cwd() / args.out).resolve()
 	if not DLL.exists():
 		raise SystemExit(f"missing {DLL}; build the crate first")
 	if not MEMBERS.exists():
 		raise SystemExit(f"missing {MEMBERS}; generate it first")
-	PKG.mkdir(parents=True, exist_ok=True)
-	for stale in PKG.iterdir():
+	pkg.mkdir(parents=True, exist_ok=True)
+	for stale in pkg.iterdir():
 		if stale.is_file():
 			stale.unlink()
-	shutil.copy2(DLL, PKG / NAME)
-	shutil.copy2(MEMBERS, PKG / "node_members.txt")
-	(PKG / "foch-plugin.toml").write_text(
+	shutil.copy2(DLL, pkg / NAME)
+	shutil.copy2(MEMBERS, pkg / "node_members.txt")
+	(pkg / "foch-plugin.toml").write_text(
 		MANIFEST.format(dll=NAME)
-		+ f'\n[[files]]\npath = "{NAME}"\nsha256 = "{digest_of(PKG / NAME)}"\n'
-		+ f'\n[[files]]\npath = "node_members.txt"\nsha256 = "{digest_of(PKG / "node_members.txt")}"\n',
+		+ f'\n[[files]]\npath = "{NAME}"\nsha256 = "{digest_of(pkg / NAME)}"\n'
+		+ f'\n[[files]]\npath = "node_members.txt"\nsha256 = "{digest_of(pkg / "node_members.txt")}"\n',
 		encoding="utf-8",
 		newline="\n",
 	)
-	print(f"package ready at {PKG}")
-	print(f"  {NAME}: {digest_of(PKG / NAME)[:16]}...")
-	print(f"  node_members.txt: {digest_of(PKG / 'node_members.txt')[:16]}...")
+	print(f"package ready at {pkg}")
+	print(f"  {NAME}: {digest_of(pkg / NAME)[:16]}...")
+	print(f"  node_members.txt: {digest_of(pkg / 'node_members.txt')[:16]}...")
 
 
 if __name__ == "__main__":

@@ -12,3 +12,26 @@ country_event = {
 	immediate = { }
 	option = { name = OK }
 }
+
+# Receipt smoke: the plugin's decisions must reach the judge as
+# FOCH_RECEIPT/1 lines. Closing edges are guaranteed by month 6 in any
+# policy session from the 1444 start, so the receipt's request token is
+# that tick.
+#test(time=1444.11.11, tag=SWE, name="receipts_reach_the_judge",
+#     advance_days=200,
+#     expect_receipt = {
+#         plugin = "dev.foch.eu4-dynamic-trade-blackhole"
+#         case = policy_month
+#         request = 6
+#         type = edge_flip
+#     })
+country_event = {
+	id = trade_probe.2
+	title = none
+	desc = none
+	picture = none
+	hidden = yes
+	is_triggered_only = yes
+	immediate = { }
+	option = { name = OK }
+}

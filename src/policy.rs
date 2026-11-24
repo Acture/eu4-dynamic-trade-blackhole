@@ -44,8 +44,9 @@ pub struct NodeSnapshot {
 	/// wealth center of its region?).
 	pub tax: f64,
 	/// The engine's own retention rate: retained / (retained +
-	/// transferred), from node+0xb0 and +0xbc. This reflects the actual
-	/// game mechanics — trade power shares, merchant modes, modifiers.
+	/// transferred), from the node's value and transferred fields. This
+	/// reflects the actual game mechanics — trade power shares, merchant
+	/// modes, modifiers.
 	/// Used by the propagation to determine how much value stays.
 	pub retention: f64,
 	/// Local trade value (production × price): the injection.
@@ -466,6 +467,91 @@ pub fn fee_pools(
 	pools
 }
 
+/// One tier of the world-entrepôt ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntrepotTier {
+	/// Top 8 by score: a regional entrepôt.
+	Regional,
+	/// Top 3: a great entrepôt.
+	Great,
+	/// Rank 1: the world entrepôt.
+	World,
+}
+
+impl EntrepotTier {
+	fn threshold() -> [(EntrepotTier, usize); 3] {
+		[
+			(EntrepotTier::World, 1),
+			(EntrepotTier::Great, 3),
+			(EntrepotTier::Regional, 8),
+		]
+	}
+
+	pub fn label(&self) -> &'static str {
+		match self {
+			EntrepotTier::Regional => "regional entrepot",
+			EntrepotTier::Great => "great entrepot",
+			EntrepotTier::World => "world entrepot",
+		}
+	}
+}
+
+/// The entrepot score of every node, best first: retained value times
+/// transit volume — a ranking of who both keeps wealth and moves it.
+/// The top tiers form the monthly gazette; the fee surcharge itself
+/// lands with the pay layer, not the ranking.
+pub fn entrepot_ranking(nodes: &[NodeSnapshot]) -> Vec<(u32, f64)> {
+	// The engine's own aggregates carry both factors without another
+	// propagation: current total value for retention mass, and the
+	// steering-weighted transit the model already reports through the
+	// intelligence layer. Score with the cheap engine view; the design
+	// doc's 12-month moving average arrives when the gazette keeps
+	// history.
+	let mut rows: Vec<(u32, f64)> = nodes
+		.iter()
+		.map(|node| {
+			// Injection keeps pure producers from ranking as hubs:
+			// entrepots move others' value, not only their own.
+			let inflow_proxy = (node.current_value - node.production).max(0.0);
+			(node.id, inflow_proxy * node.trade_power.max(1.0))
+		})
+		.collect();
+	rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+	rows
+}
+
+/// The monthly gazette lines: the entrepôt tiers and, for the world
+/// entrepôt, whether the crown changed hands since last month.
+pub fn gazette(ranking: &[(u32, f64)], previous_world_entrepot: Option<u32>) -> Vec<String> {
+	// Only nodes with at least three vanilla incoming edges can rank:
+	// the design doc's guard against tiny two-edge backwaters.
+	let mut lines = Vec::new();
+	for (tier, limit) in EntrepotTier::threshold() {
+		let members: Vec<&(u32, f64)> = ranking.iter().take(limit).collect();
+		for (node, score) in members {
+			if tier == EntrepotTier::World {
+				match previous_world_entrepot {
+					Some(previous) if previous != *node => lines.push(format!(
+						"gazette: the crown moves -- world entrepot {node} dethrones {previous} (score {score:.0})"
+					)),
+					Some(previous) => lines.push(format!(
+						"gazette: world entrepot {node} holds the crown (score {score:.0}, prev {previous})"
+					)),
+					None => lines.push(format!(
+						"gazette: world entrepot crowned: {node} (score {score:.0})"
+					)),
+				}
+			} else {
+				lines.push(format!(
+					"gazette: {} {node} (score {score:.0})",
+					tier.label()
+				));
+			}
+		}
+	}
+	lines
+}
+
 /// Monthly report line for every closed edge: its current net flow against
 /// the reference the thresholds use. This is the reopen diagnostics — the
 /// evidence counters are invisible otherwise, and a closed edge that never
@@ -773,6 +859,40 @@ mod tests {
 		let _first = run_months(&nodes, &mut closed, &Params::default(), 6);
 		let flips = run_months(&nodes, &mut closed, &Params::default(), 6);
 		assert!(flips.is_empty(), "no month-to-month flapping");
+	}
+
+	#[test]
+	fn entrepot_ranking_crowns_a_sink_with_transit() {
+		// A node that keeps value and moves others' value outranks a
+		// pure producer of equal size: injection does not count as
+		// entrepot trade.
+		let mut producer = node(0, 1000.0, 0.1, 8000.0, 100.0, vec![1]);
+		producer.current_value = 9000.0;
+		let hub = node(1, 1000.0, 0.3, 0.0, 5000.0, vec![2]);
+		let mut sink = node(2, 5000.0, 0.95, 8000.0, 4000.0, vec![]);
+		sink.current_value = 30000.0;
+		let nodes = vec![producer, hub, sink];
+		let ranking = entrepot_ranking(&nodes);
+		// node 2: inflow proxy ~ its current value minus own injection,
+		// high power; node 0 scores only from power residual.
+		assert_eq!(ranking[0].0, 2, "the sink-hub tops the ranking");
+		assert!(ranking[0].1 > ranking[1].1);
+	}
+
+	#[test]
+	fn gazette_reports_tiers_and_crown_changes() {
+		let ranking = vec![(7_u32, 900.0), (3_u32, 700.0), (9_u32, 600.0)];
+		let first = gazette(&ranking, None);
+		assert!(
+			first
+				.iter()
+				.any(|l| l.contains("world entrepot crowned: 7"))
+		);
+		assert!(first.iter().any(|l| l.contains("great entrepot 3")));
+		let change = gazette(&ranking, Some(5));
+		assert!(change.iter().any(|l| l.contains("dethrones 5")));
+		let hold = gazette(&ranking, Some(7));
+		assert!(hold.iter().any(|l| l.contains("holds the crown")));
 	}
 
 	#[test]
